@@ -1599,8 +1599,8 @@
       projectId: "lykos-maquinas-1",
       storageBucket: "lykos-maquinas-1.firebasestorage.app",
       messagingSenderId: "161269601166",
-      appId: "1:161269601166:web:5b275a843a99ad0cf14adf",
-      measurementId: "G-57PBMRSJ5L"
+      appId: "1:161269601166:web:b4edde91c2777dd1f14adf",
+      measurementId: "G-167RQPC9YS"
     };
 
     const CLOUD_DOC_PATH = ["artifacts", "lykos-maquinas-1", "public", "data", "fleet_state", "main"];
@@ -1614,6 +1614,16 @@
     let cloudSyncReady = false;
     let cloudLastError = "";
     let pendingCloudPushTimer = null;
+
+    function formatCloudError(err) {
+      if (!err) return "";
+      const code = err.code || "";
+      const msg = err.message || String(err);
+      if (code === "PERMISSION_DENIED" || msg.includes("PERMISSION_DENIED") || msg.includes("Missing or insufficient permissions")) {
+        return "Permiso denegado en Firebase: revisa las Reglas de Realtime Database / Firestore y asegúrate de tener habilitado Anónimo en Authentication.";
+      }
+      return msg;
+    }
 
     function updateCloudBadge(statusText, tone = "live") {
       const pill = document.getElementById("cloud-sync-pill");
@@ -1678,14 +1688,20 @@
         tasks.push(
           setDoc(doc(db, ...CLOUD_DOC_PATH), envelope)
             .then(() => { firestoreConnected = true; anyOk = true; })
-            .catch((err) => { cloudLastError = err?.message || cloudLastError; })
+            .catch((err) => {
+              firestoreConnected = false;
+              cloudLastError = formatCloudError(err) || cloudLastError;
+            })
         );
       }
       if (rtdb) {
         tasks.push(
           set(ref(rtdb, RTDB_STATE_PATH), envelope)
             .then(() => { rtdbConnected = true; anyOk = true; })
-            .catch((err) => { cloudLastError = err?.message || cloudLastError; })
+            .catch((err) => {
+              rtdbConnected = false;
+              cloudLastError = formatCloudError(err) || cloudLastError;
+            })
         );
       }
 
@@ -1711,7 +1727,9 @@
         db = getFirestore(app);
         rtdb = getDatabase(app);
 
-        await signInAnonymously(auth).catch(() => {});
+        await signInAnonymously(auth).catch((err) => {
+          cloudLastError = formatCloudError(err) || cloudLastError;
+        });
 
         let listenersStarted = false;
         const startListeners = async () => {
@@ -1737,7 +1755,8 @@
               firestoreConnected = true;
             }
           } catch (e) {
-            cloudLastError = e?.message || "Firestore pendiente de configuración/reglas.";
+            firestoreConnected = false;
+            cloudLastError = formatCloudError(e) || "Firestore pendiente de configuración/reglas.";
           }
 
           onSnapshot(docRef, (snap) => {
@@ -1746,7 +1765,8 @@
             const d = snap.data();
             applyIncomingPayload(d?.payload, d?.updatedAt);
           }, (err) => {
-            cloudLastError = err?.message || cloudLastError;
+            firestoreConnected = false;
+            cloudLastError = formatCloudError(err) || cloudLastError;
             if (!rtdbConnected) updateCloudBadge("Local", "local");
           });
 
@@ -1765,7 +1785,8 @@
               rtdbConnected = true;
             }
           } catch (e) {
-            cloudLastError = e?.message || cloudLastError;
+            rtdbConnected = false;
+            cloudLastError = formatCloudError(e) || cloudLastError;
           }
 
           onValue(rtdbRef, (rSnap) => {
@@ -1774,7 +1795,8 @@
             const rVal = rSnap.val();
             applyIncomingPayload(rVal?.payload, rVal?.updatedAt);
           }, (err) => {
-            cloudLastError = err?.message || cloudLastError;
+            rtdbConnected = false;
+            cloudLastError = formatCloudError(err) || cloudLastError;
             if (!firestoreConnected) updateCloudBadge("Local", "local");
           });
 
@@ -1802,7 +1824,7 @@
           startListeners();
         }, 800);
       } catch (err) {
-        cloudLastError = err?.message || "Error inicializando conexión.";
+        cloudLastError = formatCloudError(err) || "Error inicializando conexión.";
         updateCloudBadge("Local", "local");
       }
     }
