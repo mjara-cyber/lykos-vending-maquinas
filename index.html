@@ -1615,11 +1615,13 @@
 
     const CLOUD_DOC_PATH = ["artifacts", "lykos-maquinas-1", "public", "data", "fleet_state", "main"];
     const RTDB_STATE_PATH = "lykos_fleet/state";
+    const RTDB_MACHINES_PATH = "lykos_fleet/machines";
     let db = null;
     let rtdb = null;
     let firestoreConnected = false;
     let rtdbConnected = false;
     let lastAppliedUpdatedAt = 0;
+    let lastLocalMutationAt = 0;
     let isApplyingRemoteSnapshot = false;
     let cloudSyncReady = false;
     let cloudLastError = "";
@@ -1628,20 +1630,9 @@
     function updateCloudBadge(statusText, tone = "live") {
       const pill = document.getElementById("cloud-sync-pill");
       const dot = document.getElementById("cloud-sync-dot");
-      const label = document.getElementById("cloud-sync-text");
+      const text = document.getElementById("cloud-sync-text");
       const detail = document.getElementById("cloud-status-detail");
-      if (label) label.textContent = statusText;
-      if (detail) {
-        if (tone === "live") {
-          const activeEngines = [
-            firestoreConnected ? "Firestore" : null,
-            rtdbConnected ? "Realtime Database" : null
-          ].filter(Boolean).join(" + ");
-          detail.textContent = `Conectado en vivo (${activeEngines || "Nube"}): todos los equipos comparten el mismo inventario y bitácora.`;
-        } else {
-          detail.textContent = cloudLastError || "Modo local activo (revisa las reglas de lectura/escritura en tu consola del proyecto si necesitas nube pública).";
-        }
-      }
+      if (text) text.textContent = statusText;
       if (pill && dot) {
         if (tone === "live") {
           pill.className = "cursor-pointer inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-800 text-[10px] font-extrabold";
@@ -1651,12 +1642,21 @@
           dot.className = "w-2 h-2 rounded-full bg-amber-500";
         }
       }
+      if (detail) {
+        const channels = [];
+        if (firestoreConnected) channels.push("Firestore");
+        if (rtdbConnected) channels.push("Realtime DB");
+        detail.textContent = channels.length
+          ? `Conectado en tiempo real (${channels.join(" + ")})`
+          : (cloudLastError ? `Respaldo local activo (${cloudLastError})` : "Respaldo local activo");
+      }
     }
 
     function applyIncomingPayload(payloadStr, updatedAt = 0) {
       if (!payloadStr || isApplyingRemoteSnapshot) return;
       const stamp = Number(updatedAt || 0);
       if (stamp > 0 && stamp <= lastAppliedUpdatedAt) return;
+      if (stamp > 0 && lastLocalMutationAt > stamp) return;
       try {
         const remoteState = JSON.parse(payloadStr);
         if (remoteState && Array.isArray(remoteState.machines)) {
@@ -1671,15 +1671,37 @@
       }
     }
 
+    function applyIncomingMachinesMap(machinesVal, updatedAt = 0) {
+      if (!machinesVal || isApplyingRemoteSnapshot) return;
+      const stamp = Number(updatedAt || 0);
+      if (stamp > 0 && lastLocalMutationAt > stamp && (Date.now() - lastLocalMutationAt) < 4000) return;
+      const remoteMachines = Array.isArray(machinesVal)
+        ? machinesVal.filter(Boolean)
+        : Object.values(machinesVal).filter(Boolean);
+      const localMachinesCount = (window.appState && Array.isArray(window.appState.machines)) ? window.appState.machines.length : 0;
+      if (remoteMachines.length === 0 && localMachinesCount > 0 && (Date.now() - lastLocalMutationAt) < 5000) {
+        return;
+      }
+      isApplyingRemoteSnapshot = true;
+      window.applyRemoteMachines(remoteMachines, stamp);
+      isApplyingRemoteSnapshot = false;
+      updateCloudBadge("En vivo", "live");
+    }
+
     async function pushStateToCloud(stateObj) {
       if (!cloudSyncReady || isApplyingRemoteSnapshot) return;
-      const nowStamp = Date.now();
+      const nowStamp = Math.max(Date.now(), lastAppliedUpdatedAt + 1, lastLocalMutationAt);
       lastAppliedUpdatedAt = nowStamp;
       const envelope = {
         payload: JSON.stringify(stateObj),
         updatedAt: nowStamp,
         sourceDevice: navigator.userAgent.slice(0, 60)
       };
+
+      const machinesMap = {};
+      (stateObj.machines || []).forEach(m => {
+        if (m && m.id) machinesMap[m.id] = m;
+      });
 
       let anyOk = false;
       const tasks = [];
@@ -1697,6 +1719,11 @@
             .then(() => { rtdbConnected = true; anyOk = true; })
             .catch((err) => { cloudLastError = err?.message || cloudLastError; })
         );
+        tasks.push(
+          set(ref(rtdb, RTDB_MACHINES_PATH), { items: machinesMap, updatedAt: nowStamp })
+            .then(() => { rtdbConnected = true; anyOk = true; })
+            .catch((err) => { cloudLastError = err?.message || cloudLastError; })
+        );
       }
 
       await Promise.allSettled(tasks);
@@ -1708,10 +1735,11 @@
     }
 
     window.syncCloudNow = function (stateObj) {
+      lastLocalMutationAt = Date.now();
       if (pendingCloudPushTimer) clearTimeout(pendingCloudPushTimer);
       pendingCloudPushTimer = setTimeout(() => {
         pushStateToCloud(stateObj);
-      }, 30);
+      }, 20);
     };
 
     async function initRealtimeSync() {
@@ -1721,6 +1749,8 @@
         db = getFirestore(app);
         rtdb = getDatabase(app);
 
+        await signInAnonymously(auth).catch(() => {});
+
         let listenersStarted = false;
         const startListeners = async () => {
           if (listenersStarted) return;
@@ -1729,6 +1759,24 @@
 
           const docRef = doc(db, ...CLOUD_DOC_PATH);
           const rtdbRef = ref(rtdb, RTDB_STATE_PATH);
+          const rtdbMachinesRef = ref(rtdb, RTDB_MACHINES_PATH);
+
+          try {
+            const snap = await getDoc(docRef);
+            if (snap.exists()) {
+              firestoreConnected = true;
+              const d = snap.data();
+              applyIncomingPayload(d?.payload, d?.updatedAt);
+            } else if (window.appState) {
+              await setDoc(docRef, {
+                payload: JSON.stringify(window.appState),
+                updatedAt: Date.now()
+              });
+              firestoreConnected = true;
+            }
+          } catch (e) {
+            cloudLastError = e?.message || "Firestore pendiente de configuración/reglas.";
+          }
 
           onSnapshot(docRef, (snap) => {
             if (!snap.exists()) return;
@@ -1740,6 +1788,23 @@
             if (!rtdbConnected) updateCloudBadge("Local", "local");
           });
 
+          try {
+            const rSnap = await get(rtdbRef);
+            if (rSnap.exists()) {
+              rtdbConnected = true;
+              const rVal = rSnap.val();
+              applyIncomingPayload(rVal?.payload, rVal?.updatedAt);
+            } else if (window.appState) {
+              await set(rtdbRef, {
+                payload: JSON.stringify(window.appState),
+                updatedAt: Date.now()
+              });
+              rtdbConnected = true;
+            }
+          } catch (e) {
+            cloudLastError = e?.message || cloudLastError;
+          }
+
           onValue(rtdbRef, (rSnap) => {
             if (!rSnap.exists()) return;
             rtdbConnected = true;
@@ -1750,31 +1815,18 @@
             if (!firestoreConnected) updateCloudBadge("Local", "local");
           });
 
-          try {
-            const [snap, rSnap] = await Promise.allSettled([getDoc(docRef), get(rtdbRef)]);
-            if (snap.status === "fulfilled" && snap.value.exists()) {
-              firestoreConnected = true;
-              const d = snap.value.data();
-              applyIncomingPayload(d?.payload, d?.updatedAt);
-            } else if (rSnap.status === "fulfilled" && rSnap.value.exists()) {
-              rtdbConnected = true;
-              const rVal = rSnap.value.val();
-              applyIncomingPayload(rVal?.payload, rVal?.updatedAt);
-            } else if (window.appState) {
-              const seedEnvelope = {
-                payload: JSON.stringify(window.appState),
-                updatedAt: Date.now()
-              };
-              if (snap.status === "fulfilled") {
-                setDoc(docRef, seedEnvelope).then(() => { firestoreConnected = true; }).catch(() => {});
-              }
-              if (rSnap.status === "fulfilled") {
-                set(rtdbRef, seedEnvelope).then(() => { rtdbConnected = true; }).catch(() => {});
-              }
+          onValue(rtdbMachinesRef, (mSnap) => {
+            if (!mSnap.exists()) return;
+            rtdbConnected = true;
+            const mVal = mSnap.val();
+            if (mVal && typeof mVal === "object" && "items" in mVal) {
+              applyIncomingMachinesMap(mVal.items, mVal.updatedAt);
+            } else {
+              applyIncomingMachinesMap(mVal, Date.now());
             }
-          } catch (e) {
-            cloudLastError = e?.message || "Sincronización inicial pendiente.";
-          }
+          }, (err) => {
+            cloudLastError = err?.message || cloudLastError;
+          });
 
           if (firestoreConnected || rtdbConnected) {
             updateCloudBadge("En vivo", "live");
@@ -1783,12 +1835,9 @@
           }
         };
 
-        startListeners();
         onAuthStateChanged(auth, () => {
           startListeners();
         });
-        signInAnonymously(auth).catch(() => {});
-
         window.addEventListener("online", () => {
           if (cloudSyncReady && window.appState) {
             pushStateToCloud(window.appState);
@@ -1799,6 +1848,9 @@
             pushStateToCloud(window.appState);
           }
         });
+        setTimeout(() => {
+          startListeners();
+        }, 500);
       } catch (err) {
         cloudLastError = err?.message || "Error inicializando conexión.";
         updateCloudBadge("Local", "local");
@@ -1812,7 +1864,6 @@
     const STORAGE_KEY = 'lykos_fleet_lifecycle_v1';
     let currentSession = null;
     let currentMachineId = null;
-    let newMachinePhotoDataUrl = '';
 
     // Estado del flujo de Revisión Técnica en 3 Etapas
     let revisionDraft = null;
@@ -1821,6 +1872,7 @@
     let selectedNextMaintOpt = 'KEEP';
     let pmovDraftItems = [];
     let editPmovItemsDraft = [];
+    let newMachinePhotoDraft = '';
 
     let activeMapTargetRow = null;
     let activeMapTargetMode = 'CLIENT';
@@ -1981,27 +2033,60 @@
       }
     }
 
-    window.applyRemoteState = function (remoteState) {
-      if (!remoteState || !Array.isArray(remoteState.machines)) return;
-      appState = remoteState;
-      window.appState = appState;
-      try { localStorage.setItem(STORAGE_KEY, JSON.stringify(appState)); } catch (e) {}
-      if (currentSession) {
-        populateAllWarehouseSelects();
-        refreshAllViews();
-        if (currentMachineId && !document.getElementById('modal-lifecycle')?.classList.contains('hidden')) {
+    function refreshOpenUiAfterSync() {
+      if (!currentSession) return;
+      populateAllWarehouseSelects();
+      refreshAllViews();
+      if (currentMachineId && !document.getElementById('modal-lifecycle')?.classList.contains('hidden')) {
+        const stillExists = (appState.machines || []).some(m => m.id === currentMachineId);
+        if (stillExists) {
           renderLifecycleTimeline();
+        } else {
+          currentMachineId = null;
+          closeModal('modal-lifecycle');
         }
       }
+    }
+
+    window.applyRemoteState = function (remoteState) {
+      if (!remoteState || !Array.isArray(remoteState.machines)) return;
+      const localMachines = Array.isArray(appState.machines) ? appState.machines : [];
+      const remoteMachines = remoteState.machines.filter(Boolean);
+      const mergedMap = new Map();
+      remoteMachines.forEach(m => { if (m && m.id) mergedMap.set(m.id, m); });
+      localMachines.forEach(m => {
+        if (m && m.id && !mergedMap.has(m.id)) {
+          mergedMap.set(m.id, m);
+        }
+      });
+      appState = {
+        ...remoteState,
+        machines: Array.from(mergedMap.values())
+      };
+      window.appState = appState;
+      try { localStorage.setItem(STORAGE_KEY, JSON.stringify(appState)); } catch (e) {}
+      refreshOpenUiAfterSync();
+    };
+
+    window.applyRemoteMachines = function (remoteMachinesList) {
+      if (!Array.isArray(remoteMachinesList)) return;
+      const mergedMap = new Map();
+      remoteMachinesList.forEach(m => { if (m && m.id) mergedMap.set(m.id, m); });
+      (appState.machines || []).forEach(m => {
+        if (m && m.id && !mergedMap.has(m.id)) {
+          mergedMap.set(m.id, m);
+        }
+      });
+      appState.machines = Array.from(mergedMap.values());
+      window.appState = appState;
+      try { localStorage.setItem(STORAGE_KEY, JSON.stringify(appState)); } catch (e) {}
+      refreshOpenUiAfterSync();
     };
 
     function openCloudStatusModal() {
       document.getElementById('modal-cloud-status')?.classList.remove('hidden');
     }
 
-    // =========================================================================
-    // HELPERS
-    // =========================================================================
     function isManager() {
       return currentSession && currentSession.role === 'gerencia';
     }
@@ -2147,9 +2232,6 @@
       renderGlobalBitacora();
     }
 
-    // =========================================================================
-    // KPIS Y FILTROS
-    // =========================================================================
     function isMaintenanceDueSoon(m) {
       if (!m.nextMaintenance || m.status === 'Bodega' || m.status === 'Retirada') return false;
       const diffDays = Math.ceil((new Date(m.nextMaintenance + 'T00:00:00') - new Date()) / 86400000);
@@ -2528,20 +2610,17 @@
 
         return `
         <div class="relative pl-11">
-          <!-- Icono circular en línea de tiempo -->
           <span class="absolute left-0.5 top-2 w-8 h-8 rounded-full bg-[#243360] text-[#F2B705] border-2 border-white shadow flex items-center justify-center text-xs">
             <i class="fa-solid fa-wrench"></i>
           </span>
 
           <div class="bg-white p-4 rounded-2xl border border-[#dfe6f5] shadow-sm space-y-2.5">
-            <!-- Cabecera del Registro -->
             <div class="flex items-start justify-between gap-2">
               <div class="flex flex-wrap items-baseline gap-2">
                 <span class="font-extrabold text-sm text-[#243360]">${escapeHtml(item.title)}</span>
                 <span class="font-mono text-xs text-slate-400">${escapeHtml(dateFormatted)}</span>
               </div>
 
-              <!-- Botones Editar y Eliminar Registro -->
               <div class="flex items-center gap-1.5 shrink-0" data-manager-only="true">
                 <button type="button" onclick="openEditLifecycleEntryModal('${safeId}', ${item.isActiveRev})" title="Editar registro" class="w-8 h-8 rounded-xl bg-[#f1f4fa] hover:bg-[#dfe6f5] text-[#243360] flex items-center justify-center text-xs transition-colors">
                   <i class="fa-solid fa-pen"></i>
@@ -2552,7 +2631,6 @@
               </div>
             </div>
 
-            <!-- Técnico y Ubicación -->
             <p class="text-xs text-slate-600 flex flex-wrap items-center gap-1.5">
               <i class="fa-solid fa-user-gear text-[#dca500]"></i>
               <strong class="text-[#243360]">${escapeHtml(item.tech)}</strong>
@@ -2561,7 +2639,6 @@
               <span>${escapeHtml(item.location)}</span>
             </p>
 
-            <!-- Caja de Falla / Motivo Inicial + Botón Desplegable -->
             <div class="bg-[#f8fafe] p-3 rounded-xl border border-[#dfe6f5] space-y-3">
               <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
                 <p class="text-xs text-slate-800">
@@ -2573,7 +2650,6 @@
                 </button>
               </div>
 
-              <!-- Contenido Desplegable Paso a Paso -->
               <div id="tl-details-${safeId}" class="hidden pt-3 border-t border-[#dfe6f5] space-y-3">
                 ${stagesHtml}
                 ${partsHtml}
@@ -2702,9 +2778,6 @@
       showToast('Registro eliminado del historial.');
     }
 
-    // =========================================================================
-    // FLUJO DE REVISIÓN TÉCNICA EN 3 ETAPAS
-    // =========================================================================
     function openNewLogModal() {
       const m = appState.machines.find(x => x.id === currentMachineId);
       if (!m) return;
@@ -3304,6 +3377,36 @@
       showToast('Ubicación de máquina actualizada.');
     }
 
+    function handleMachinePhotoUpload(e) {
+      const f = e.target.files?.[0];
+      if (!f) return;
+      const r = new FileReader();
+      r.onload = ev => {
+        newMachinePhotoDraft = ev.target.result;
+        syncMachinePhotoPreview(newMachinePhotoDraft);
+      };
+      r.readAsDataURL(f);
+      e.target.value = '';
+    }
+
+    function syncMachinePhotoPreview(dataUrl) {
+      const box = document.getElementById('machine-photo-preview');
+      const img = document.getElementById('machine-photo-img');
+      if (!box || !img) return;
+      if (dataUrl) {
+        img.src = dataUrl;
+        box.classList.remove('hidden');
+      } else {
+        img.src = '';
+        box.classList.add('hidden');
+      }
+    }
+
+    function clearMachinePhoto() {
+      newMachinePhotoDraft = '';
+      syncMachinePhotoPreview('');
+    }
+
     function openMachineModal(editId = null) {
       if (!isManager()) return;
       populateAllWarehouseSelects();
@@ -3320,41 +3423,9 @@
       document.getElementById('machine-status').value = m ? m.status : 'Bodega';
       document.getElementById('machine-warehouse').value = m ? m.warehouse : (appState.warehouses[0] || 'Chillán');
       document.getElementById('machine-next-maint').value = m ? (m.nextMaintenance || '') : '';
-      const photoInput = document.getElementById('machine-photo-input');
-      if (photoInput) photoInput.value = '';
-      syncMachinePhotoPreview(m ? (m.photo || '') : '');
+      newMachinePhotoDraft = m ? (m.photo || '') : '';
+      syncMachinePhotoPreview(newMachinePhotoDraft);
       document.getElementById('modal-machine').classList.remove('hidden');
-    }
-
-    function handleMachinePhotoUpload(e) {
-      const f = e.target.files?.[0];
-      if (!f) return;
-      const r = new FileReader();
-      r.onload = ev => {
-        newMachinePhotoDataUrl = ev.target.result;
-        syncMachinePhotoPreview(newMachinePhotoDataUrl);
-      };
-      r.readAsDataURL(f);
-    }
-
-    function syncMachinePhotoPreview(dataUrl) {
-      newMachinePhotoDataUrl = dataUrl || '';
-      const box = document.getElementById('machine-photo-preview');
-      const img = document.getElementById('machine-photo-img');
-      if (!box || !img) return;
-      if (dataUrl) {
-        img.src = dataUrl;
-        box.classList.remove('hidden');
-      } else {
-        img.src = '';
-        box.classList.add('hidden');
-      }
-    }
-
-    function clearMachinePhoto() {
-      const photoInput = document.getElementById('machine-photo-input');
-      if (photoInput) photoInput.value = '';
-      syncMachinePhotoPreview('');
     }
 
     function editCurrentMachine() {
@@ -3364,53 +3435,51 @@
     function saveMachine(e) {
       e.preventDefault();
       const id = document.getElementById('machine-id').value;
+      const codeVal = document.getElementById('machine-code').value.trim().toUpperCase();
+      const photoFinal = newMachinePhotoDraft || `https://placehold.co/400x400/243360/F2B705?text=${encodeURIComponent(codeVal)}`;
       const payload = {
-        code: document.getElementById('machine-code').value.trim().toUpperCase(),
+        code: codeVal,
         serial: document.getElementById('machine-serial').value.trim().toUpperCase(),
         brand: document.getElementById('machine-brand').value.trim(),
         model: document.getElementById('machine-model').value.trim(),
         type: document.getElementById('machine-type').value,
         status: document.getElementById('machine-status').value,
         warehouse: document.getElementById('machine-warehouse').value,
-        nextMaintenance: document.getElementById('machine-next-maint').value
+        nextMaintenance: document.getElementById('machine-next-maint').value,
+        photo: photoFinal
       };
       if (id) {
         const m = appState.machines.find(x => x.id === id);
-        if (m) {
-          Object.assign(m, payload);
-          if (newMachinePhotoDataUrl) {
-            m.photo = newMachinePhotoDataUrl;
-          }
-        }
+        if (m) Object.assign(m, payload);
       } else {
-        const finalPhoto = newMachinePhotoDataUrl || `https://placehold.co/400x400/243360/F2B705?text=${encodeURIComponent(payload.code)}`;
-        const initialLogs = newMachinePhotoDataUrl
-          ? [{
-              id: 'log-' + Date.now(),
-              date: getChileDateTimeLocal(),
-              type: 'Alta de Equipo / Foto Inicial',
-              tech: currentSession?.name || 'Gerencia',
-              location: `Bodega Regional ${payload.warehouse}`,
-              initialNotes: 'Registro inicial del equipo con fotografía de ingreso.',
-              initialPhoto: newMachinePhotoDataUrl,
-              stages: [],
-              notes: 'Equipo registrado en inventario con fotografía inicial.',
-              parts: [],
-              photo: ''
-            }]
-          : [];
+        const whMeta = getWarehouseLocationMeta(payload.warehouse);
         appState.machines.push({
           id: 'mac-' + Date.now(),
           ...payload,
           maintInterval: 'Cada 3 meses',
           clientId: '',
           locationId: '',
-          photo: finalPhoto,
           activeRevision: null,
-          logs: initialLogs
+          logs: [
+            {
+              id: 'log-' + Date.now(),
+              date: getChileDateTimeLocal(),
+              type: 'Alta de Máquina y Foto Inicial',
+              tech: currentSession?.name || 'Gerencia',
+              location: `Bodega Regional ${payload.warehouse} (${whMeta.address})`,
+              initialNotes: `Registro inicial del equipo ${payload.code} (${payload.brand} ${payload.model}, Serie ${payload.serial}) en estado ${payload.status}.`,
+              initialPhoto: newMachinePhotoDraft || '',
+              stages: [],
+              notes: newMachinePhotoDraft
+                ? 'Equipo incorporado al inventario con fotografía inicial adjunta.'
+                : 'Equipo incorporado al inventario.',
+              parts: [],
+              photo: newMachinePhotoDraft || ''
+            }
+          ]
         });
       }
-      newMachinePhotoDataUrl = '';
+      newMachinePhotoDraft = '';
       saveState();
       closeModal('modal-machine');
       if (currentMachineId && id === currentMachineId) openLifecycleModal(id);
@@ -3418,9 +3487,6 @@
       showToast('Ficha de máquina guardada.');
     }
 
-    // =========================================================================
-    // REPUESTOS Y MOVIMIENTOS
-    // =========================================================================
     function selectWarehouseFilter(wh) {
       document.getElementById('filter-parts-warehouse').value = wh;
       renderParts();
@@ -3513,7 +3579,7 @@
       appState.parts = (appState.parts || []).filter(x => x.id !== partId);
       saveState();
       refreshAllViews();
-      showToast(`Repuesto ${p.sku} eliminado.`);
+      showToast(`Repuesto ${p.sku} eliminado de Bodega ${p.warehouse}.`);
     }
 
     function openPartsMovementModal(type) {
@@ -3753,9 +3819,11 @@
           </div>
           <div class="flex items-center gap-1.5 shrink-0">
             <button type="button" onclick="updatePartsMovementItemQty(${idx}, -1)" class="w-6 h-6 rounded-lg bg-white border border-slate-300 font-black text-[#243360] hover:bg-slate-100">-</button>
-            <input type="number" min="1" value="${item.qty}" onchange="updatePartsMovementItemQty(${idx}, this.value, true)" class="w-14 px-1.5 py-1 bg-white border border-slate-300 rounded-lg text-center font-black text-[#243360]" />
+            <input type="number" min="1" value="${item.qty}" onchange="updatePartsMovementItemQty(${idx}, this.value, true)" class="w-12 py-1 bg-white border border-slate-300 rounded-lg text-xs font-extrabold text-center text-[#243360]" />
             <button type="button" onclick="updatePartsMovementItemQty(${idx}, 1)" class="w-6 h-6 rounded-lg bg-white border border-slate-300 font-black text-[#243360] hover:bg-slate-100">+</button>
-            <button type="button" onclick="removePartsMovementItem(${idx})" title="Quitar ítem" class="ml-1 w-7 h-7 rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-600 flex items-center justify-center font-extrabold"><i class="fa-solid fa-trash-can text-[11px]"></i></button>
+            <button type="button" onclick="removePartsMovementItem(${idx})" title="Quitar repuesto" class="w-7 h-7 rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-600 flex items-center justify-center ml-1">
+              <i class="fa-solid fa-trash-can text-[11px]"></i>
+            </button>
           </div>
         </div>`).join('');
     }
@@ -3763,79 +3831,63 @@
     function savePartsMovement(e) {
       e.preventDefault();
       const type = document.getElementById('pmov-type').value;
-      const srcWh = document.getElementById('pmov-src-wh').value;
-      const tgtWh = document.getElementById('pmov-tgt-wh').value;
+      const src = document.getElementById('pmov-src-wh').value;
+      const tgt = document.getElementById('pmov-tgt-wh').value;
 
-      if (type === 'TRASPASO' && srcWh === tgtWh) {
-        showToast('La bodega origen y destino deben ser distintas.', 'error');
+      if (pmovDraftItems.length === 0) {
+        showToast('Agrega al menos un repuesto al listado antes de confirmar.', 'error');
         return;
       }
-      if (pmovDraftItems.length === 0) {
-        showToast('Agrega al menos un repuesto a la orden o traspaso.', 'error');
+
+      if (type === 'TRASPASO' && src === tgt) {
+        showToast('La bodega de origen y destino deben ser diferentes.', 'error');
         return;
       }
 
       if (type === 'TRASPASO') {
         for (const item of pmovDraftItems) {
-          const srcPart = (appState.parts || []).find(p => p.sku === item.sku && p.warehouse === srcWh);
+          const srcPart = appState.parts.find(p => p.sku === item.sku && p.warehouse === src);
           if (!srcPart || Number(srcPart.stock) < Number(item.qty)) {
-            showToast(`Stock insuficiente de ${item.sku} en Bodega ${srcWh}.`, 'error');
+            showToast(`Stock insuficiente de ${item.sku} en Bodega ${src}.`, 'error');
             return;
           }
         }
+        pmovDraftItems.forEach(item => {
+          const srcPart = appState.parts.find(p => p.sku === item.sku && p.warehouse === src);
+          if (srcPart) srcPart.stock = Number(srcPart.stock) - Number(item.qty);
+        });
       }
 
-      const appliedItems = [];
-      for (const item of pmovDraftItems) {
-        const qty = Math.max(1, parseInt(item.qty, 10) || 1);
-        const catalogRef = (appState.parts || []).find(p => p.sku === item.sku);
-        const minStockRef = catalogRef ? (catalogRef.minStock || 2) : 2;
-        const partName = item.name || (catalogRef ? catalogRef.name : item.sku);
-
-        if (type === 'INGRESO') {
-          let tgtPart = (appState.parts || []).find(p => p.sku === item.sku && p.warehouse === tgtWh);
-          if (!tgtPart) {
-            tgtPart = {
-              id: 'prt-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6),
-              sku: item.sku,
-              name: partName,
-              warehouse: tgtWh,
-              stock: 0,
-              minStock: minStockRef
-            };
-            appState.parts.push(tgtPart);
-          }
-          tgtPart.stock = Number(tgtPart.stock) + qty;
+      pmovDraftItems.forEach(item => {
+        let tgtPart = appState.parts.find(p => p.sku === item.sku && p.warehouse === tgt);
+        if (tgtPart) {
+          tgtPart.stock = Number(tgtPart.stock) + Number(item.qty);
         } else {
-          const srcPart = (appState.parts || []).find(p => p.sku === item.sku && p.warehouse === srcWh);
-          srcPart.stock = Math.max(0, Number(srcPart.stock) - qty);
-
-          let tgtPart = (appState.parts || []).find(p => p.sku === item.sku && p.warehouse === tgtWh);
-          if (!tgtPart) {
-            tgtPart = {
-              id: 'prt-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6),
-              sku: item.sku,
-              name: partName,
-              warehouse: tgtWh,
-              stock: 0,
-              minStock: srcPart.minStock || 2
-            };
-            appState.parts.push(tgtPart);
-          }
-          tgtPart.stock = Number(tgtPart.stock) + qty;
+          const refPart = appState.parts.find(p => p.sku === item.sku);
+          appState.parts.push({
+            id: 'prt-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6),
+            sku: item.sku,
+            name: item.name,
+            warehouse: tgt,
+            stock: Number(item.qty),
+            minStock: refPart ? (refPart.minStock || 2) : 2
+          });
         }
+      });
 
-        appliedItems.push({ sku: item.sku, name: partName, qty });
-      }
+      const firstItem = pmovDraftItems[0];
+      const totalQty = pmovDraftItems.reduce((acc, it) => acc + Number(it.qty), 0);
 
-      appState.partsMovements = appState.partsMovements || [];
       appState.partsMovements.unshift({
         id: 'pmov-' + Date.now(),
-        date: getChileDateTimeLocal(),
         type,
-        sourceWarehouse: type === 'TRASPASO' ? srcWh : '',
-        targetWarehouse: tgtWh,
-        items: appliedItems,
+        src,
+        tgt,
+        sku: firstItem.sku,
+        name: firstItem.name,
+        qty: totalQty,
+        items: pmovDraftItems.map(it => ({ ...it })),
+        date: getChileDateTimeLocal(),
         user: currentSession?.name || 'Sistema'
       });
 
@@ -3843,7 +3895,7 @@
       saveState();
       closeModal('modal-parts-movement');
       refreshAllViews();
-      showToast(type === 'TRASPASO' ? 'Traspaso entre bodegas registrado.' : 'Orden de ingreso registrada.');
+      showToast('Movimiento de repuestos registrado.');
     }
 
     function clearPartsMovementsDateFilter() {
@@ -3855,73 +3907,65 @@
     }
 
     function renderPartsMovementsHistory() {
-      const box = document.getElementById('parts-movements-list');
-      if (!box) return;
-
+      const list = document.getElementById('parts-movements-list');
+      if (!list) return;
       const fromDate = document.getElementById('pmov-filter-from')?.value || '';
       const toDate = document.getElementById('pmov-filter-to')?.value || '';
 
-      const allMovs = appState.partsMovements || [];
-      const filtered = allMovs.filter(mv => {
-        const dayOnly = String(mv.date || '').slice(0, 10);
+      const movs = (appState.partsMovements || []).filter(m => {
+        const dayOnly = String(m.date || '').slice(0, 10);
         if (fromDate && dayOnly && dayOnly < fromDate) return false;
         if (toDate && dayOnly && dayOnly > toDate) return false;
         return true;
       });
 
-      const countEl = document.getElementById('pmov-records-count');
-      if (countEl) countEl.textContent = `${filtered.length} registro(s)`;
+      const countBadge = document.getElementById('pmov-records-count');
+      if (countBadge) countBadge.textContent = `${movs.length} registro(s)`;
 
-      if (filtered.length === 0) {
-        box.innerHTML = `<div class="p-6 text-center text-xs text-slate-400">${allMovs.length === 0 ? 'Aún no hay órdenes de ingreso ni traspasos registrados.' : 'No hay registros en el rango de fechas seleccionado.'}</div>`;
-        return;
-      }
-
-      box.innerHTML = filtered.map(mv => {
-        const isTraspaso = mv.type === 'TRASPASO';
-        const itemsText = (mv.items || []).map(it => `${it.sku} - ${it.name} x${it.qty}`).join(', ');
-        return `
-        <div class="p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs hover:bg-[#f8fafe]">
-          <div class="space-y-1">
-            <div class="flex flex-wrap items-center gap-2">
-              <span class="px-2.5 py-0.5 rounded-full font-extrabold text-[10px] ${isTraspaso ? 'bg-[#243360] text-[#F2B705]' : 'bg-emerald-100 text-emerald-800'}">${escapeHtml(mv.type)}</span>
-              <span class="font-mono text-slate-400">${escapeHtml(String(mv.date || '').replace('T', ' ').slice(0, 16))}</span>
-              <span class="font-bold text-[#243360]">• ${escapeHtml(mv.user || 'Sistema')}</span>
+      list.innerHTML = movs.length === 0
+        ? `<div class="p-4 text-center text-xs text-slate-500">No hay movimientos en el rango de fechas seleccionado.</div>`
+        : movs.map(m => {
+          const itemsSummary = Array.isArray(m.items) && m.items.length > 0
+            ? m.items.map(it => `${escapeHtml(it.sku)} - ${escapeHtml(it.name)} (x${it.qty})`).join(' • ')
+            : `${escapeHtml(m.sku)} - ${escapeHtml(m.name)} (x${m.qty})`;
+          return `
+          <div class="p-3.5 text-xs flex items-center justify-between gap-3 hover:bg-[#f8fafe]">
+            <div class="min-w-0 flex-1">
+              <span class="font-extrabold text-[#243360]">${escapeHtml(m.type)}</span> • ${itemsSummary}
+              <p class="text-slate-500 mt-0.5">${m.type === 'TRASPASO' ? `De Bodega ${escapeHtml(m.src)} a Bodega ${escapeHtml(m.tgt)}` : `Ingreso a Bodega ${escapeHtml(m.tgt)}`} • ${escapeHtml(m.user)}</p>
             </div>
-            <p class="font-bold text-slate-800">${escapeHtml(itemsText)}</p>
-            <p class="text-[11px] text-slate-500">${isTraspaso ? `Bodega ${escapeHtml(mv.sourceWarehouse)} &rarr; Bodega ${escapeHtml(mv.targetWarehouse)}` : `Ingreso a Bodega ${escapeHtml(mv.targetWarehouse)}`}</p>
-          </div>
-          <div class="flex items-center gap-1.5 shrink-0" data-manager-only="true">
-            <button type="button" onclick="openEditPartsMovementModal('${escapeHtml(mv.id)}')" title="Editar orden" class="w-8 h-8 rounded-xl bg-[#f1f4fa] hover:bg-[#dfe6f5] text-[#243360] flex items-center justify-center text-xs transition-colors">
-              <i class="fa-solid fa-pen"></i>
-            </button>
-            <button type="button" onclick="deletePartsMovement('${escapeHtml(mv.id)}')" title="Eliminar orden" class="w-8 h-8 rounded-xl bg-rose-50 hover:bg-rose-100 text-rose-600 flex items-center justify-center text-xs transition-colors">
-              <i class="fa-solid fa-trash-can"></i>
-            </button>
-          </div>
-        </div>`;
-      }).join('');
+            <div class="flex items-center gap-2 shrink-0">
+              <span class="font-mono text-slate-400">${escapeHtml((m.date || '').replace('T', ' ').slice(0, 16))}</span>
+              <div class="flex items-center gap-1.5" data-manager-only="true">
+                <button type="button" onclick="openEditPartsMovementModal('${escapeHtml(m.id)}')" title="Editar movimiento" class="w-8 h-8 rounded-xl bg-[#f1f4fa] hover:bg-[#dfe6f5] text-[#243360] flex items-center justify-center text-xs transition-colors">
+                  <i class="fa-solid fa-pen"></i>
+                </button>
+                <button type="button" onclick="deletePartsMovement('${escapeHtml(m.id)}')" title="Eliminar movimiento" class="w-8 h-8 rounded-xl bg-rose-50 hover:bg-rose-100 text-rose-600 flex items-center justify-center text-xs transition-colors">
+                  <i class="fa-solid fa-trash-can"></i>
+                </button>
+              </div>
+            </div>
+          </div>`;
+        }).join('');
       applyRolePermissionsToUI();
     }
 
     function openEditPartsMovementModal(movId) {
       if (!isManager()) return;
-      const mv = (appState.partsMovements || []).find(x => x.id === movId);
-      if (!mv) return;
       populateAllWarehouseSelects();
+      const mov = (appState.partsMovements || []).find(m => m.id === movId);
+      if (!mov) return;
 
-      document.getElementById('edit-pmov-id').value = mv.id;
-      document.getElementById('edit-pmov-type').value = mv.type || 'INGRESO';
-      document.getElementById('edit-pmov-date').value = String(mv.date || getChileDateTimeLocal()).slice(0, 16);
-      document.getElementById('edit-pmov-src').value = mv.sourceWarehouse || (appState.warehouses[0] || 'Chillán');
-      document.getElementById('edit-pmov-tgt').value = mv.targetWarehouse || (appState.warehouses[0] || 'Chillán');
-      document.getElementById('edit-pmov-user').value = mv.user || '';
+      document.getElementById('edit-pmov-id').value = mov.id;
+      document.getElementById('edit-pmov-type').value = mov.type || 'INGRESO';
+      document.getElementById('edit-pmov-date').value = String(mov.date || getChileDateTimeLocal()).slice(0, 16);
+      document.getElementById('edit-pmov-src').value = mov.src || (appState.warehouses[0] || 'Chillán');
+      document.getElementById('edit-pmov-tgt').value = mov.tgt || (appState.warehouses[0] || 'Chillán');
+      document.getElementById('edit-pmov-user').value = mov.user || '';
 
-      editPmovItemsDraft = (mv.items || []).map(it => ({
-        sku: it.sku || '',
-        name: it.name || '',
-        qty: Math.max(1, parseInt(it.qty, 10) || 1)
-      }));
+      editPmovItemsDraft = Array.isArray(mov.items) && mov.items.length > 0
+        ? mov.items.map(it => ({ ...it }))
+        : [{ sku: mov.sku || '', name: mov.name || '', qty: Number(mov.qty || 1) }];
 
       onEditPartsMovementTypeChange();
       renderEditPartsMovementItems();
@@ -3929,29 +3973,20 @@
     }
 
     function onEditPartsMovementTypeChange() {
-      const isTraspaso = document.getElementById('edit-pmov-type').value === 'TRASPASO';
+      const type = document.getElementById('edit-pmov-type').value;
+      const isTraspaso = type === 'TRASPASO';
       document.getElementById('edit-pmov-src-box').classList.toggle('hidden', !isTraspaso);
       document.getElementById('edit-pmov-tgt-box').className = isTraspaso ? '' : 'sm:col-span-2';
     }
 
     function renderEditPartsMovementItems() {
-      const box = document.getElementById('edit-pmov-items-list');
-      if (!box) return;
-      if (editPmovItemsDraft.length === 0) {
-        box.innerHTML = `<p class="text-xs text-slate-400">Sin ítems registrados.</p>`;
-        return;
-      }
-      box.innerHTML = editPmovItemsDraft.map((it, idx) => `
-        <div class="flex items-center justify-between gap-2 bg-[#f8fafe] p-2.5 rounded-xl border border-[#dfe6f5] text-xs">
-          <div class="min-w-0 flex-1">
-            <span class="font-mono font-extrabold text-[#243360]">${escapeHtml(it.sku)}</span>
-            <span class="font-bold text-slate-800 ml-1">${escapeHtml(it.name)}</span>
-          </div>
-          <div class="flex items-center gap-1.5 shrink-0">
-            <label class="text-[10px] font-bold text-slate-500">Cant:</label>
-            <input type="number" min="1" value="${it.qty}" onchange="editPmovItemsDraft[${idx}].qty = Math.max(1, parseInt(this.value, 10) || 1)" class="w-16 px-2 py-1 bg-white border border-slate-300 rounded-lg text-center font-extrabold text-[#243360]" />
-            <button type="button" onclick="editPmovItemsDraft.splice(${idx}, 1); renderEditPartsMovementItems();" title="Quitar ítem" class="w-7 h-7 rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-600 flex items-center justify-center"><i class="fa-solid fa-trash-can text-[11px]"></i></button>
-          </div>
+      const container = document.getElementById('edit-pmov-items-list');
+      if (!container) return;
+      container.innerHTML = editPmovItemsDraft.map((it, idx) => `
+        <div class="grid grid-cols-12 gap-2 items-center bg-[#f8fafe] p-2.5 rounded-xl border border-[#dfe6f5] text-xs">
+          <input type="text" value="${escapeHtml(it.sku)}" onchange="editPmovItemsDraft[${idx}].sku = this.value.trim().toUpperCase()" placeholder="SKU" class="col-span-3 px-2.5 py-1.5 bg-white border border-slate-300 rounded-lg font-mono font-bold text-[#243360]" />
+          <input type="text" value="${escapeHtml(it.name)}" onchange="editPmovItemsDraft[${idx}].name = this.value.trim()" placeholder="Nombre repuesto" class="col-span-6 px-2.5 py-1.5 bg-white border border-slate-300 rounded-lg font-bold text-slate-800" />
+          <input type="number" min="1" value="${Number(it.qty || 1)}" onchange="editPmovItemsDraft[${idx}].qty = Math.max(1, parseInt(this.value, 10) || 1)" class="col-span-3 px-2.5 py-1.5 bg-white border border-slate-300 rounded-lg font-extrabold text-center text-[#243360]" />
         </div>`).join('');
     }
 
@@ -3959,30 +3994,29 @@
       e.preventDefault();
       if (!isManager()) return;
       const movId = document.getElementById('edit-pmov-id').value;
-      const mv = (appState.partsMovements || []).find(x => x.id === movId);
-      if (!mv) return;
+      const mov = (appState.partsMovements || []).find(m => m.id === movId);
+      if (!mov) return;
 
-      const newType = document.getElementById('edit-pmov-type').value;
-      const newDate = document.getElementById('edit-pmov-date').value;
-      const newSrc = document.getElementById('edit-pmov-src').value;
-      const newTgt = document.getElementById('edit-pmov-tgt').value;
-      const newUser = document.getElementById('edit-pmov-user').value.trim();
+      const validItems = editPmovItemsDraft
+        .map(it => ({
+          sku: String(it.sku || '').trim().toUpperCase(),
+          name: String(it.name || '').trim(),
+          qty: Math.max(1, parseInt(it.qty, 10) || 1)
+        }))
+        .filter(it => it.sku || it.name);
 
-      if (newType === 'TRASPASO' && newSrc === newTgt) {
-        showToast('La bodega origen y destino deben ser distintas.', 'error');
-        return;
+      mov.type = document.getElementById('edit-pmov-type').value;
+      mov.date = document.getElementById('edit-pmov-date').value || mov.date;
+      mov.src = document.getElementById('edit-pmov-src').value;
+      mov.tgt = document.getElementById('edit-pmov-tgt').value;
+      mov.user = document.getElementById('edit-pmov-user').value.trim();
+
+      if (validItems.length > 0) {
+        mov.items = validItems;
+        mov.sku = validItems[0].sku;
+        mov.name = validItems[0].name;
+        mov.qty = validItems.reduce((sum, x) => sum + Number(x.qty || 0), 0);
       }
-
-      mv.type = newType;
-      if (newDate) mv.date = newDate;
-      mv.sourceWarehouse = newType === 'TRASPASO' ? newSrc : '';
-      mv.targetWarehouse = newTgt;
-      mv.user = newUser || mv.user;
-      mv.items = editPmovItemsDraft.map(it => ({
-        sku: it.sku,
-        name: it.name,
-        qty: Math.max(1, parseInt(it.qty, 10) || 1)
-      }));
 
       saveState();
       closeModal('modal-edit-parts-movement');
@@ -3992,87 +4026,87 @@
 
     function deletePartsMovement(movId) {
       if (!isManager()) return;
-      appState.partsMovements = (appState.partsMovements || []).filter(x => x.id !== movId);
+      appState.partsMovements = (appState.partsMovements || []).filter(m => m.id !== movId);
       saveState();
       refreshAllViews();
-      showToast('Orden eliminada del historial.');
+      showToast('Registro de movimiento eliminado.');
     }
 
-    // =========================================================================
-    // CLIENTES, MAPA INTERACTIVO Y WAZE
-    // =========================================================================
     function renderClients() {
-      const box = document.getElementById('clients-list');
-      if (!box) return;
       const q = (document.getElementById('filter-clients-search')?.value || '').trim().toLowerCase();
-      const list = (appState.clients || []).filter(c => {
-        const locsText = (c.locations || []).map(l => `${l.name} ${l.address}`).join(' ');
-        return !q || `${c.name} ${c.industry || ''} ${locsText}`.toLowerCase().includes(q);
+      const listEl = document.getElementById('clients-list');
+      if (!listEl) return;
+
+      const clients = (appState.clients || []).filter(c => {
+        if (!q) return true;
+        const locsText = (c.locations || []).map(l => `${l.name} ${l.address} ${l.contact || ''}`).join(' ');
+        return `${c.name} ${c.industry || ''} ${locsText}`.toLowerCase().includes(q);
       });
 
-      box.innerHTML = list.map(c => `
-        <div class="bg-white rounded-2xl border border-[#dfe6f5] shadow-sm p-4 space-y-3">
+      listEl.innerHTML = clients.map(c => {
+        const assignedCount = (appState.machines || []).filter(m => m.clientId === c.id).length;
+        return `
+        <div class="bg-white rounded-2xl border border-[#dfe6f5] shadow-sm p-5 space-y-3.5">
           <div class="flex items-start justify-between gap-2">
             <div>
               <h3 class="font-extrabold text-base text-[#243360]">${escapeHtml(c.name)}</h3>
-              <p class="text-xs text-slate-500 font-semibold">${escapeHtml(c.industry || 'Cliente Corporativo')}</p>
+              <p class="text-xs text-slate-500 font-semibold">${escapeHtml(c.industry || 'General')} • ${assignedCount} máquina(s) asignada(s)</p>
             </div>
-            <div class="flex items-center gap-1.5" data-manager-only="true">
-              <button type="button" onclick="openClientModal('${escapeHtml(c.id)}')" class="px-2.5 py-1 rounded-lg bg-[#f1f4fa] text-[#243360] text-xs font-bold">Editar</button>
-              <button type="button" onclick="deleteClient('${escapeHtml(c.id)}')" class="px-2.5 py-1 rounded-lg bg-rose-50 text-rose-600 text-xs font-bold">Eliminar</button>
-            </div>
+            <button type="button" onclick="openClientModal('${escapeHtml(c.id)}')" data-manager-only="true" class="px-3 py-1.5 rounded-xl bg-[#f1f4fa] hover:bg-[#dfe6f5] text-[#243360] text-xs font-extrabold">
+              <i class="fa-solid fa-pen mr-1"></i>Editar
+            </button>
           </div>
           <div class="space-y-2">
-            ${(c.locations || []).map(l => `
-              <div class="p-3 rounded-xl bg-[#f8fafe] border border-[#dfe6f5] flex items-center justify-between gap-2 text-xs">
+            ${(c.locations || []).map(loc => {
+              const locMachines = (appState.machines || []).filter(m => m.clientId === c.id && m.locationId === loc.id);
+              return `
+              <div class="p-3 rounded-xl bg-[#f8fafe] border border-[#dfe6f5] flex items-center justify-between gap-2">
                 <div class="min-w-0">
-                  <p class="font-extrabold text-[#243360] truncate">${escapeHtml(l.name)}</p>
-                  <p class="text-slate-600 truncate"><i class="fa-solid fa-location-dot text-rose-500 mr-1"></i>${escapeHtml(l.address)}</p>
+                  <p class="text-xs font-extrabold text-[#243360] truncate">${escapeHtml(loc.name)} <span class="text-[10px] font-bold text-[#dca500]">(${locMachines.length} máq.)</span></p>
+                  <p class="text-[11px] text-slate-500 truncate"><i class="fa-solid fa-location-dot text-rose-500 mr-1"></i>${escapeHtml(loc.address)}</p>
                 </div>
-                <a href="${buildWazeUrl(l.address, l.lat, l.lng)}" target="_blank" rel="noopener noreferrer" class="px-3 py-1.5 rounded-xl bg-[#33ccff] text-slate-950 font-extrabold shrink-0 flex items-center gap-1">
+                <a href="${buildWazeUrl(loc.address, loc.lat, loc.lng)}" target="_blank" rel="noopener noreferrer" class="px-3 py-1.5 rounded-xl bg-[#33ccff] hover:bg-[#19b8f0] text-slate-950 font-extrabold text-xs shrink-0 flex items-center gap-1">
                   <i class="fa-brands fa-waze"></i><span>Waze</span>
                 </a>
-              </div>`).join('')}
+              </div>`;
+            }).join('')}
           </div>
-        </div>`).join('');
+        </div>`;
+      }).join('');
       applyRolePermissionsToUI();
     }
 
     function openClientModal(clientId = null) {
       if (!isManager()) return;
-      const c = clientId ? appState.clients.find(x => x.id === clientId) : null;
-      document.getElementById('client-id').value = c ? c.id : '';
-      document.getElementById('client-name').value = c ? c.name : '';
-      document.getElementById('client-industry').value = c ? (c.industry || '') : '';
-      const container = document.getElementById('client-locations-container');
-      container.innerHTML = '';
-      const locs = (c?.locations && c.locations.length) ? c.locations : [{ name: '', address: '', contact: '', phone: '', lat: null, lng: null }];
+      const cli = clientId ? appState.clients.find(c => c.id === clientId) : null;
+      document.getElementById('client-id').value = cli ? cli.id : '';
+      document.getElementById('client-name').value = cli ? cli.name : '';
+      document.getElementById('client-industry').value = cli ? (cli.industry || '') : '';
+      const cont = document.getElementById('client-locations-container');
+      cont.innerHTML = '';
+      const locs = cli?.locations?.length ? cli.locations : [{ id: 'loc-' + Date.now(), name: '', address: '', lat: null, lng: null }];
       locs.forEach(l => addLocationRow(l));
       document.getElementById('modal-client').classList.remove('hidden');
     }
 
-    function addLocationRow(data = {}) {
-      const container = document.getElementById('client-locations-container');
+    function addLocationRow(loc = {}) {
+      const cont = document.getElementById('client-locations-container');
       const row = document.createElement('div');
-      row.className = 'client-loc-row p-3 rounded-xl bg-[#f8fafe] border border-[#dfe6f5] space-y-2';
+      row.className = 'loc-row p-3 rounded-xl bg-[#f8fafe] border border-[#dfe6f5] space-y-2';
+      row.setAttribute('data-loc-id', loc.id || ('loc-' + Date.now() + '-' + Math.random().toString(36).slice(2, 5)));
+      row.setAttribute('data-lat', loc.lat ?? '');
+      row.setAttribute('data-lng', loc.lng ?? '');
       row.innerHTML = `
         <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
-          <input type="text" class="loc-name px-3 py-1.5 bg-white border border-slate-300 rounded-lg text-xs font-bold text-[#243360]" placeholder="Nombre sucursal *" value="${escapeHtml(data.name || '')}" required />
+          <input type="text" value="${escapeHtml(loc.name || '')}" required placeholder="Nombre sucursal / punto *" class="loc-name px-3 py-1.5 bg-white border border-slate-300 rounded-lg text-xs font-bold" />
           <div class="flex gap-1.5">
-            <input type="text" class="loc-address flex-1 px-3 py-1.5 bg-white border border-slate-300 rounded-lg text-xs font-semibold text-[#243360]" placeholder="Dirección (o marca en el mapa) *" value="${escapeHtml(data.address || '')}" required />
-            <button type="button" onclick="openLocationMapPicker(this.closest('.client-loc-row'))" title="Seleccionar en mapa" class="px-2.5 py-1.5 rounded-lg bg-[#243360] text-[#F2B705] text-xs font-extrabold shrink-0">
+            <input type="text" value="${escapeHtml(loc.address || '')}" required placeholder="Dirección sucursal *" class="loc-address flex-1 px-3 py-1.5 bg-white border border-slate-300 rounded-lg text-xs font-semibold" />
+            <button type="button" onclick="openLocationMapPicker(this.closest('.loc-row'))" title="Marcar en mapa" class="px-3 py-1.5 rounded-lg bg-[#243360] text-[#F2B705] text-xs font-extrabold shrink-0">
               <i class="fa-solid fa-map-location-dot"></i>
             </button>
           </div>
-        </div>
-        <div class="flex items-center justify-between text-[11px] text-slate-500">
-          <span class="loc-coords-label font-mono">${data.lat && data.lng ? `GPS: ${Number(data.lat).toFixed(5)}, ${Number(data.lng).toFixed(5)}` : 'Sin coordenadas GPS'}</span>
-          <button type="button" onclick="this.closest('.client-loc-row').remove()" class="text-rose-600 font-bold hover:underline">Quitar</button>
-        </div>
-        <input type="hidden" class="loc-id" value="${escapeHtml(data.id || ('loc-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6)))}" />
-        <input type="hidden" class="loc-lat" value="${escapeHtml(data.lat ?? '')}" />
-        <input type="hidden" class="loc-lng" value="${escapeHtml(data.lng ?? '')}" />`;
-      container.appendChild(row);
+        </div>`;
+      cont.appendChild(row);
     }
 
     function saveClient(e) {
@@ -4080,12 +4114,12 @@
       const id = document.getElementById('client-id').value;
       const name = document.getElementById('client-name').value.trim();
       const industry = document.getElementById('client-industry').value.trim();
-      const locations = Array.from(document.querySelectorAll('#client-locations-container .client-loc-row')).map(row => ({
-        id: row.querySelector('.loc-id').value || ('loc-' + Date.now()),
+      const locations = Array.from(document.querySelectorAll('#client-locations-container .loc-row')).map(row => ({
+        id: row.getAttribute('data-loc-id'),
         name: row.querySelector('.loc-name').value.trim(),
         address: row.querySelector('.loc-address').value.trim(),
-        lat: row.querySelector('.loc-lat').value ? parseFloat(row.querySelector('.loc-lat').value) : null,
-        lng: row.querySelector('.loc-lng').value ? parseFloat(row.querySelector('.loc-lng').value) : null
+        lat: row.getAttribute('data-lat') ? parseFloat(row.getAttribute('data-lat')) : null,
+        lng: row.getAttribute('data-lng') ? parseFloat(row.getAttribute('data-lng')) : null
       })).filter(l => l.name && l.address);
 
       if (id) {
@@ -4097,112 +4131,84 @@
       saveState();
       closeModal('modal-client');
       refreshAllViews();
-      showToast('Cliente y sucursales guardados.');
+      showToast('Empresa cliente guardada.');
     }
 
-    function deleteClient(clientId) {
-      if (!isManager()) return;
-      appState.clients = appState.clients.filter(x => x.id !== clientId);
-      saveState();
-      refreshAllViews();
-      showToast('Cliente eliminado.');
-    }
+    function initOrUpdateLocationMap(lat, lng) {
+      const centerLat = lat || -36.6066;
+      const centerLng = lng || -72.1034;
+      selectedMapLat = centerLat;
+      selectedMapLng = centerLng;
+      document.getElementById('map-selected-coords').textContent = `${centerLat.toFixed(5)}, ${centerLng.toFixed(5)}`;
 
-    // Mapa Leaflet + Geocoding inverso/directo
-    function ensureLeafletMap(defaultLat = -36.6066, defaultLng = -72.1034) {
-      if (typeof L === 'undefined') return null;
-      if (!locationMapInstance) {
-        locationMapInstance = L.map('client-location-leaflet-map').setView([defaultLat, defaultLng], 14);
-        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-          attribution: '&copy; OpenStreetMap'
-        }).addTo(locationMapInstance);
-        locationMapInstance.on('click', async (ev) => {
-          await setMapPoint(ev.latlng.lat, ev.latlng.lng, true);
-        });
-      }
-      setTimeout(() => locationMapInstance.invalidateSize(), 120);
-      return locationMapInstance;
-    }
+      setTimeout(() => {
+        if (!locationMapInstance) {
+          locationMapInstance = L.map('client-location-leaflet-map').setView([centerLat, centerLng], 15);
+          L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; OpenStreetMap' }).addTo(locationMapInstance);
+          locationMapMarker = L.marker([centerLat, centerLng], { draggable: true }).addTo(locationMapInstance);
 
-    async function reverseGeocodeChile(lat, lng) {
-      try {
-        const res = await fetch(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lng}&addressdetails=1`);
-        const data = await res.json();
-        if (data?.display_name) {
-          const a = data.address || {};
-          const road = a.road || a.pedestrian || a.suburb || '';
-          const num = a.house_number ? ` ${a.house_number}` : '';
-          const city = a.city || a.town || a.village || a.county || '';
-          const shortAddr = [road + num, city].filter(Boolean).join(', ');
-          return shortAddr || data.display_name.split(',').slice(0, 3).join(',').trim();
-        }
-      } catch (e) {}
-      return `Ubicación GPS (${lat.toFixed(5)}, ${lng.toFixed(5)})`;
-    }
+          const onCoordPicked = async (ptLat, ptLng) => {
+            selectedMapLat = ptLat;
+            selectedMapLng = ptLng;
+            locationMapMarker.setLatLng([ptLat, ptLng]);
+            document.getElementById('map-selected-coords').textContent = `${ptLat.toFixed(5)}, ${ptLng.toFixed(5)}`;
+            try {
+              const res = await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${ptLat}&lon=${ptLng}`);
+              const data = await res.json();
+              if (data?.display_name) {
+                const shortAddr = data.display_name.split(',').slice(0, 4).join(',').trim();
+                document.getElementById('map-selected-address-input').value = shortAddr;
+                syncAddressToActiveRow(shortAddr);
+              }
+            } catch (err) {}
+          };
 
-    function syncAddressToActiveRow(addrVal) {
-      if (activeMapTargetMode === 'WAREHOUSE') {
-        const whAddrInput = document.getElementById('config-warehouse-address');
-        if (whAddrInput) whAddrInput.value = addrVal;
-        return;
-      }
-      if (activeMapTargetRow) {
-        const rowAddr = activeMapTargetRow.querySelector('.loc-address');
-        if (rowAddr) rowAddr.value = addrVal;
-      }
-    }
-
-    async function setMapPoint(lat, lng, shouldReverse = true) {
-      selectedMapLat = lat;
-      selectedMapLng = lng;
-      const map = ensureLeafletMap(lat, lng);
-      if (map) {
-        if (!locationMapMarker) {
-          locationMapMarker = L.marker([lat, lng]).addTo(map);
+          locationMapInstance.on('click', ev => onCoordPicked(ev.latlng.lat, ev.latlng.lng));
+          locationMapMarker.on('dragend', ev => {
+            const pos = ev.target.getLatLng();
+            onCoordPicked(pos.lat, pos.lng);
+          });
         } else {
-          locationMapMarker.setLatLng([lat, lng]);
+          locationMapInstance.setView([centerLat, centerLng], 15);
+          locationMapMarker.setLatLng([centerLat, centerLng]);
         }
-        map.setView([lat, lng], Math.max(map.getZoom(), 15));
-      }
-      document.getElementById('map-selected-coords').textContent = `${lat.toFixed(5)}, ${lng.toFixed(5)}`;
-      if (shouldReverse) {
-        const addr = await reverseGeocodeChile(lat, lng);
-        document.getElementById('map-selected-address-input').value = addr;
-        syncAddressToActiveRow(addr);
-      }
+        locationMapInstance.invalidateSize();
+      }, 150);
     }
 
-    async function openLocationMapPicker(rowEl) {
+    function openLocationMapPicker(rowEl) {
       activeMapTargetMode = 'CLIENT';
       activeMapTargetRow = rowEl;
-      document.getElementById('modal-location-map').classList.remove('hidden');
-      const existingLat = parseFloat(rowEl.querySelector('.loc-lat')?.value);
-      const existingLng = parseFloat(rowEl.querySelector('.loc-lng')?.value);
-      const existingAddr = rowEl.querySelector('.loc-address')?.value || '';
-      document.getElementById('map-selected-address-input').value = existingAddr;
+      const existingAddr = rowEl?.querySelector('.loc-address')?.value || '';
+      const existingLat = parseFloat(rowEl?.getAttribute('data-lat'));
+      const existingLng = parseFloat(rowEl?.getAttribute('data-lng'));
       document.getElementById('map-search-query').value = existingAddr;
-      if (!Number.isNaN(existingLat) && !Number.isNaN(existingLng)) {
-        await setMapPoint(existingLat, existingLng, !existingAddr);
-      } else {
-        ensureLeafletMap(-36.6066, -72.1034);
-      }
+      document.getElementById('map-selected-address-input').value = existingAddr;
+      document.getElementById('modal-location-map').classList.remove('hidden');
+      initOrUpdateLocationMap(!isNaN(existingLat) ? existingLat : null, !isNaN(existingLng) ? existingLng : null);
     }
 
-    async function openWarehouseMapPicker() {
+    function openWarehouseMapPicker() {
       activeMapTargetMode = 'WAREHOUSE';
       activeMapTargetRow = null;
-      document.getElementById('modal-location-map').classList.remove('hidden');
       const whName = document.getElementById('config-new-warehouse')?.value.trim() || '';
-      const whMeta = getWarehouseLocationMeta(whName);
-      const existingLat = parseFloat(document.getElementById('config-warehouse-lat')?.value) || whMeta.lat || -36.6066;
-      const existingLng = parseFloat(document.getElementById('config-warehouse-lng')?.value) || whMeta.lng || -72.1034;
-      const existingAddr = document.getElementById('config-warehouse-address')?.value.trim() || whMeta.address || '';
+      const existingAddr = document.getElementById('config-warehouse-address')?.value.trim() || '';
+      const existingLat = parseFloat(document.getElementById('config-warehouse-lat')?.value);
+      const existingLng = parseFloat(document.getElementById('config-warehouse-lng')?.value);
+      const queryVal = existingAddr || (whName ? `${whName}, Chile` : '');
+      document.getElementById('map-search-query').value = queryVal;
       document.getElementById('map-selected-address-input').value = existingAddr;
-      document.getElementById('map-search-query').value = existingAddr || (whName ? `${whName}, Chile` : '');
-      if (!Number.isNaN(existingLat) && !Number.isNaN(existingLng)) {
-        await setMapPoint(existingLat, existingLng, !existingAddr);
-      } else {
-        ensureLeafletMap(-36.6066, -72.1034);
+      document.getElementById('modal-location-map').classList.remove('hidden');
+      initOrUpdateLocationMap(!isNaN(existingLat) ? existingLat : null, !isNaN(existingLng) ? existingLng : null);
+    }
+
+    function syncAddressToActiveRow(addr) {
+      if (activeMapTargetMode === 'WAREHOUSE') {
+        const whAddrEl = document.getElementById('config-warehouse-address');
+        if (whAddrEl) whAddrEl.value = addr;
+      } else if (activeMapTargetRow) {
+        const addrInput = activeMapTargetRow.querySelector('.loc-address');
+        if (addrInput) addrInput.value = addr;
       }
     }
 
@@ -4210,59 +4216,47 @@
       const q = document.getElementById('map-search-query').value.trim();
       if (!q) return;
       try {
-        const res = await fetch(`https://nominatim.openstreetmap.org/search?format=jsonv2&countrycodes=cl&limit=1&q=${encodeURIComponent(q)}`);
+        const res = await fetch(`https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(q)}`);
         const arr = await res.json();
         if (arr && arr[0]) {
           const lat = parseFloat(arr[0].lat);
-          const lng = parseFloat(arr[0].lon);
-          const displayAddr = arr[0].display_name.split(',').slice(0, 3).join(',').trim();
-          await setMapPoint(lat, lng, false);
-          document.getElementById('map-selected-address-input').value = displayAddr;
-          syncAddressToActiveRow(displayAddr);
-          return;
+          const lon = parseFloat(arr[0].lon);
+          selectedMapLat = lat;
+          selectedMapLng = lon;
+          const shortAddr = (arr[0].display_name || q).split(',').slice(0, 4).join(',').trim();
+          document.getElementById('map-selected-address-input').value = shortAddr;
+          syncAddressToActiveRow(shortAddr);
+          initOrUpdateLocationMap(lat, lon);
+        } else {
+          showToast('No se encontró la dirección en el mapa.', 'error');
         }
-      } catch (e) {}
-      showToast('No se encontró la dirección. Haz clic directo sobre el mapa.', 'error');
+      } catch (e) {
+        showToast('Error al buscar dirección.', 'error');
+      }
     }
 
     function useCurrentGpsOnMap() {
-      if (!navigator.geolocation) {
-        showToast('Tu dispositivo no soporta GPS.', 'error');
-        return;
-      }
-      navigator.geolocation.getCurrentPosition(
-        async (pos) => { await setMapPoint(pos.coords.latitude, pos.coords.longitude, true); },
-        () => { showToast('No se pudo obtener ubicación GPS.', 'error'); }
-      );
+      if (!navigator.geolocation) return;
+      navigator.geolocation.getCurrentPosition(pos => {
+        initOrUpdateLocationMap(pos.coords.latitude, pos.coords.longitude);
+      });
     }
 
     function confirmLocationFromMap() {
-      const addrVal = document.getElementById('map-selected-address-input').value.trim();
+      const finalAddr = document.getElementById('map-selected-address-input').value.trim();
       if (activeMapTargetMode === 'WAREHOUSE') {
-        if (addrVal) document.getElementById('config-warehouse-address').value = addrVal;
-        if (selectedMapLat !== null && selectedMapLng !== null) {
-          document.getElementById('config-warehouse-lat').value = selectedMapLat;
-          document.getElementById('config-warehouse-lng').value = selectedMapLng;
-        }
-        closeModal('modal-location-map');
-        showToast('Ubicación de bodega aplicada desde el mapa.');
-        return;
-      }
-      if (activeMapTargetRow) {
-        if (addrVal) activeMapTargetRow.querySelector('.loc-address').value = addrVal;
-        if (selectedMapLat !== null && selectedMapLng !== null) {
-          activeMapTargetRow.querySelector('.loc-lat').value = selectedMapLat;
-          activeMapTargetRow.querySelector('.loc-lng').value = selectedMapLng;
-          activeMapTargetRow.querySelector('.loc-coords-label').textContent = `GPS: ${selectedMapLat.toFixed(5)}, ${selectedMapLng.toFixed(5)}`;
-        }
+        if (finalAddr) document.getElementById('config-warehouse-address').value = finalAddr;
+        if (selectedMapLat !== null) document.getElementById('config-warehouse-lat').value = selectedMapLat;
+        if (selectedMapLng !== null) document.getElementById('config-warehouse-lng').value = selectedMapLng;
+      } else if (activeMapTargetRow) {
+        if (finalAddr) activeMapTargetRow.querySelector('.loc-address').value = finalAddr;
+        if (selectedMapLat !== null) activeMapTargetRow.setAttribute('data-lat', selectedMapLat);
+        if (selectedMapLng !== null) activeMapTargetRow.setAttribute('data-lng', selectedMapLng);
       }
       closeModal('modal-location-map');
-      showToast('Dirección y coordenadas aplicadas a la sucursal.');
+      showToast('Ubicación y dirección aplicadas.');
     }
 
-    // =========================================================================
-    // BITÁCORA GLOBAL
-    // =========================================================================
     function clearBitacoraDateFilter() {
       const fromEl = document.getElementById('bitacora-filter-from');
       const toEl = document.getElementById('bitacora-filter-to');
@@ -4272,204 +4266,90 @@
     }
 
     function renderGlobalBitacora() {
-      const box = document.getElementById('global-bitacora-list');
-      if (!box) return;
+      const container = document.getElementById('global-bitacora-list');
+      if (!container) return;
       const q = (document.getElementById('filter-bitacora')?.value || '').trim().toLowerCase();
       const fromDate = document.getElementById('bitacora-filter-from')?.value || '';
       const toDate = document.getElementById('bitacora-filter-to')?.value || '';
-      const rows = [];
 
+      const all = [];
       (appState.machines || []).forEach(m => {
         if (m.activeRevision) {
           const rev = m.activeRevision;
-          rows.push({
+          all.push({
             id: rev.id,
-            isActiveRev: true,
             machineId: m.id,
+            isActiveRev: true,
             code: m.code,
-            brand: m.brand,
-            model: m.model,
+            model: `${m.brand} ${m.model}`,
             date: rev.startedAt,
             type: rev.mode === 'TALLER' ? `En Revisión - Taller ${rev.targetWarehouse || m.warehouse}` : 'En Revisión - En el Lugar',
             tech: rev.tech,
             location: rev.locationLabel,
-            initialNotes: rev.initialNotes,
-            stages: rev.stages || [],
-            parts: rev.parts || [],
-            notes: ''
+            initialNotes: rev.initialNotes || '',
+            notes: rev.initialNotes || ''
           });
         }
         (m.logs || []).forEach(l => {
-          rows.push({
+          all.push({
             id: l.id,
-            isActiveRev: false,
             machineId: m.id,
+            isActiveRev: false,
             code: m.code,
-            brand: m.brand,
-            model: m.model,
+            model: `${m.brand} ${m.model}`,
             date: l.date,
             type: l.type,
             tech: l.tech,
             location: l.location,
             initialNotes: l.initialNotes || l.notes || '',
-            stages: l.stages || [],
-            parts: l.parts || [],
-            notes: l.notes || ''
+            notes: l.notes || l.initialNotes || ''
           });
         });
       });
 
-      rows.sort((a, b) => new Date(b.date) - new Date(a.date));
-      const filtered = rows.filter(r => {
-        const dayOnly = String(r.date || '').slice(0, 10);
+      all.sort((a, b) => new Date(b.date) - new Date(a.date));
+
+      const filtered = all.filter(item => {
+        const dayOnly = String(item.date || '').slice(0, 10);
         if (fromDate && dayOnly && dayOnly < fromDate) return false;
         if (toDate && dayOnly && dayOnly > toDate) return false;
-        if (q && !`${r.code} ${r.brand} ${r.model} ${r.type} ${r.tech} ${r.location} ${r.initialNotes} ${r.notes}`.toLowerCase().includes(q)) return false;
+        if (q && !`${item.code} ${item.model} ${item.type} ${item.tech} ${item.location} ${item.initialNotes} ${item.notes}`.toLowerCase().includes(q)) return false;
         return true;
       });
 
-      const countEl = document.getElementById('bitacora-records-count');
-      if (countEl) countEl.textContent = `${filtered.length} registro(s)`;
+      const countBadge = document.getElementById('bitacora-records-count');
+      if (countBadge) countBadge.textContent = `${filtered.length} registro(s)`;
 
-      if (filtered.length === 0) {
-        box.innerHTML = `<div class="bg-white rounded-2xl p-8 text-center border border-[#dfe6f5] text-xs text-slate-400">No hay registros en la bitácora con los filtros actuales.</div>`;
-        return;
-      }
-
-      box.innerHTML = filtered.map(r => {
-        const domId = `bit-${escapeHtml(r.machineId)}-${escapeHtml(r.id)}`;
-        const stagesHtml = (r.stages || []).length
-          ? `<div class="space-y-1.5">
-              <p class="text-[10px] font-extrabold uppercase text-[#243360]">Etapas (${r.stages.length})</p>
-              ${r.stages.map((st, idx) => `
-                <div class="bg-[#f8fafe] p-2.5 rounded-xl border border-[#dfe6f5] text-xs space-y-1">
-                  <div class="flex justify-between gap-2 text-[11px]">
-                    <span class="font-extrabold text-[#243360]">Etapa #${st.number || (idx + 1)} • ${escapeHtml(st.tech)}</span>
-                    <span class="font-mono text-slate-400">${escapeHtml(formatChileDisplayDateTime(st.date, true))}</span>
-                  </div>
-                  <p class="text-slate-700">${escapeHtml(st.notes)}</p>
-                </div>`).join('')}
-            </div>`
-          : '';
-
-        const partsHtml = (r.parts || []).length
-          ? `<div class="flex flex-wrap gap-1.5">
-              ${r.parts.map(p => `<span class="px-2.5 py-1 rounded-lg bg-[#fef8e6] border border-[#F2B705] font-extrabold text-[11px] text-[#243360]">${escapeHtml(p.sku ? p.sku + ' - ' : '')}${escapeHtml(p.name)} x${p.qty}</span>`).join('')}
-            </div>`
-          : '';
-
-        return `
-        <div class="bg-white p-4 rounded-2xl border border-[#dfe6f5] shadow-sm space-y-2.5 text-xs">
-          <div class="flex flex-wrap items-center justify-between gap-2">
-            <div class="flex flex-wrap items-center gap-2">
-              <button type="button" onclick="openLifecycleModal('${escapeHtml(r.machineId)}')" class="px-2.5 py-0.5 rounded bg-[#243360] text-[#F2B705] font-mono font-black">${escapeHtml(r.code)}</button>
-              <span class="font-extrabold text-[#243360]">${escapeHtml(r.type)}</span>
-              <span class="font-mono text-slate-400">${escapeHtml(String(r.date || '').replace('T', ' ').slice(0, 16))}</span>
+      container.innerHTML = filtered.length === 0
+        ? `<div class="bg-white rounded-2xl p-6 text-center text-xs text-slate-500 border border-[#dfe6f5]">Sin intervenciones para los filtros aplicados.</div>`
+        : filtered.map(item => `
+          <div class="bg-white rounded-2xl border border-[#dfe6f5] p-4 shadow-sm space-y-2">
+            <div class="flex flex-wrap items-center justify-between gap-2">
+              <div class="flex items-center gap-2">
+                <span class="px-2.5 py-0.5 rounded bg-[#243360] text-[#F2B705] font-mono font-black text-xs">${escapeHtml(item.code)}</span>
+                <span class="font-extrabold text-sm text-[#243360]">${escapeHtml(item.type)}</span>
+              </div>
+              <div class="flex items-center gap-2">
+                <span class="font-mono text-xs text-slate-400">${escapeHtml((item.date || '').replace('T', ' ').slice(0, 16))}</span>
+                <div class="flex items-center gap-1" data-manager-only="true">
+                  <button type="button" onclick="currentMachineId='${escapeHtml(item.machineId)}'; openEditLifecycleEntryModal('${escapeHtml(item.id)}', ${item.isActiveRev})" title="Editar registro" class="w-7 h-7 rounded-lg bg-[#f1f4fa] hover:bg-[#dfe6f5] text-[#243360] flex items-center justify-center text-xs transition-colors">
+                    <i class="fa-solid fa-pen"></i>
+                  </button>
+                  <button type="button" onclick="currentMachineId='${escapeHtml(item.machineId)}'; deleteLifecycleEntry('${escapeHtml(item.id)}', ${item.isActiveRev})" title="Eliminar registro" class="w-7 h-7 rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-600 flex items-center justify-center text-xs transition-colors">
+                    <i class="fa-solid fa-trash-can"></i>
+                  </button>
+                </div>
+              </div>
             </div>
-            <div class="flex items-center gap-1.5" data-manager-only="true">
-              <button type="button" onclick="currentMachineId='${escapeHtml(r.machineId)}'; openEditLifecycleEntryModal('${escapeHtml(r.id)}', ${r.isActiveRev});" title="Editar registro" class="w-8 h-8 rounded-xl bg-[#f1f4fa] hover:bg-[#dfe6f5] text-[#243360] flex items-center justify-center"><i class="fa-solid fa-pen"></i></button>
-              <button type="button" onclick="currentMachineId='${escapeHtml(r.machineId)}'; deleteLifecycleEntry('${escapeHtml(r.id)}', ${r.isActiveRev});" title="Eliminar registro" class="w-8 h-8 rounded-xl bg-rose-50 hover:bg-rose-100 text-rose-600 flex items-center justify-center"><i class="fa-solid fa-trash-can"></i></button>
-            </div>
-          </div>
-
-          <p class="text-slate-600"><strong>${escapeHtml(r.tech)}</strong> • ${escapeHtml(r.location)}</p>
-
-          <div class="bg-[#f8fafe] p-3 rounded-xl border border-[#dfe6f5] flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
-            <p class="text-slate-800"><strong class="text-[#243360]">Falla / Motivo Inicial:</strong> ${escapeHtml(r.initialNotes || 'Sin detalle inicial')}</p>
-            <button type="button" id="tl-toggle-btn-${domId}" onclick="toggleTimelineEntryDetails('${domId}')" class="px-3.5 py-2 rounded-xl bg-[#243360] hover:bg-[#192447] text-[#F2B705] font-extrabold text-xs inline-flex items-center justify-center gap-1.5 shrink-0">
-              <i class="fa-solid fa-chevron-down"></i>
-              <span>Ver trabajo realizado</span>
-            </button>
-          </div>
-
-          <div id="tl-details-${domId}" class="hidden pt-2 border-t border-[#dfe6f5] space-y-2.5">
-            ${stagesHtml}
-            ${partsHtml}
-            ${r.notes && !r.isActiveRev ? `<p class="text-slate-800 bg-emerald-50/70 p-2.5 rounded-xl border border-emerald-200"><strong class="text-emerald-800">Resolución:</strong> ${escapeHtml(r.notes)}</p>` : ''}
-          </div>
-        </div>`;
-      }).join('');
+            <p class="text-xs text-slate-600 font-semibold">Técnico: <strong class="text-[#243360]">${escapeHtml(item.tech)}</strong> • ${escapeHtml(item.location)}</p>
+            <p class="text-xs text-slate-700 bg-[#f8fafe] p-3 rounded-xl border border-[#dfe6f5]">${escapeHtml(item.notes)}</p>
+            <button type="button" onclick="openLifecycleModal('${escapeHtml(item.machineId)}')" class="text-xs font-extrabold text-[#243360] underline">Abrir Hoja de Vida del equipo &rarr;</button>
+          </div>`).join('');
       applyRolePermissionsToUI();
     }
 
-    // =========================================================================
-    // QR, COMPARTIR CELULARES, CONFIGURACIÓN Y RESPALDO
-    // =========================================================================
-    function openMachineQrModal(machineId) {
-      const m = appState.machines.find(x => x.id === machineId);
-      if (!m) return;
-      document.getElementById('qr-card-code').textContent = m.code;
-      document.getElementById('qr-card-model').textContent = `${m.brand} ${m.model} • Serie ${m.serial}`;
-      const container = document.getElementById('qr-canvas-container');
-      container.innerHTML = '';
-      if (typeof QRCode !== 'undefined') {
-        new QRCode(container, { text: `LYKOS-MACHINE:${m.code}`, width: 156, height: 156, colorDark: '#243360', colorLight: '#ffffff' });
-      }
-      document.getElementById('modal-machine-qr').classList.remove('hidden');
-    }
-
-    function openQrScannerModal() {
-      document.getElementById('modal-qr-scanner').classList.remove('hidden');
-      const statusEl = document.getElementById('qr-scanner-status');
-      if (typeof Html5Qrcode === 'undefined') {
-        statusEl.textContent = 'Ingresa el código manualmente abajo.';
-        return;
-      }
-      if (!qrScannerInstance) qrScannerInstance = new Html5Qrcode('qr-reader-region');
-      qrScannerInstance.start(
-        { facingMode: 'environment' },
-        { fps: 10, qrbox: { width: 220, height: 220 } },
-        (decodedText) => { openMachineByScannedCode(decodedText); },
-        () => {}
-      ).then(() => {
-        statusEl.textContent = 'Apunta la cámara al código QR de la máquina...';
-      }).catch(() => {
-        statusEl.textContent = 'Permiso de cámara no disponible. Ingresa el código manualmente.';
-      });
-    }
-
-    function closeQrScannerModal() {
-      if (qrScannerInstance && qrScannerInstance.isScanning) {
-        qrScannerInstance.stop().catch(() => {});
-      }
-      closeModal('modal-qr-scanner');
-    }
-
-    function openMachineByScannedCode(rawCode) {
-      const clean = String(rawCode || '').replace(/^LYKOS-MACHINE:/i, '').trim().toUpperCase();
-      if (!clean) return;
-      const found = (appState.machines || []).find(m => m.code.toUpperCase() === clean);
-      if (!found) {
-        showToast(`No se encontró máquina con código ${clean}.`, 'error');
-        return;
-      }
-      closeQrScannerModal();
-      openLifecycleModal(found.id);
-    }
-
-    function openMobileShareModal() {
-      const url = window.location.href;
-      document.getElementById('mobile-share-url').value = url;
-      const qrBox = document.getElementById('mobile-share-qr');
-      qrBox.innerHTML = '';
-      if (typeof QRCode !== 'undefined') {
-        new QRCode(qrBox, { text: url, width: 150, height: 150, colorDark: '#243360', colorLight: '#ffffff' });
-      }
-      document.getElementById('modal-mobile-share').classList.remove('hidden');
-    }
-
-    function copyMobileShareUrl() {
-      const inp = document.getElementById('mobile-share-url');
-      inp.select();
-      navigator.clipboard?.writeText(inp.value).catch(() => {});
-      showToast('Enlace copiado.');
-    }
-
     function openConfigModal() {
-      if (!isManager()) {
-        showToast('Solo Gerencia puede acceder a Configuración.', 'error');
-        return;
-      }
+      if (!isManager()) return;
       populateAllWarehouseSelects();
       cancelEditWarehouseConfig();
       cancelEditUserConfig();
@@ -4478,36 +4358,43 @@
     }
 
     function renderConfigLists() {
-      appState.warehouseLocations = appState.warehouseLocations || {};
-      document.getElementById('config-warehouses-list').innerHTML = (appState.warehouses || []).map(w => {
+      const whList = document.getElementById('config-warehouses-list');
+      whList.innerHTML = (appState.warehouses || []).map(w => {
         const meta = getWarehouseLocationMeta(w);
         return `
-        <div class="flex items-start justify-between gap-2 px-3 py-2.5 rounded-xl bg-[#f8fafe] border border-[#dfe6f5] text-xs">
-          <div class="min-w-0 space-y-0.5">
-            <p class="font-extrabold text-[#243360]">Bodega ${escapeHtml(w)}</p>
-            <p class="text-[11px] text-slate-600 truncate"><i class="fa-solid fa-location-dot text-rose-500 mr-1"></i>${escapeHtml(meta.address)}</p>
+        <div class="p-3 rounded-xl bg-[#f8fafe] border border-[#dfe6f5] flex items-start justify-between gap-2 text-xs">
+          <div class="min-w-0">
+            <span class="font-extrabold text-[#243360] block">Bodega ${escapeHtml(w)}</span>
+            <span class="text-[11px] text-slate-500 block truncate"><i class="fa-solid fa-location-dot text-rose-500 mr-1"></i>${escapeHtml(meta.address)}</span>
           </div>
           <div class="flex items-center gap-1 shrink-0">
-            <button type="button" onclick="editWarehouseConfig('${escapeHtml(w)}')" title="Editar bodega y ubicación" class="w-7 h-7 rounded-lg bg-[#f1f4fa] hover:bg-[#dfe6f5] text-[#243360] flex items-center justify-center"><i class="fa-solid fa-pen text-[11px]"></i></button>
-            <button type="button" onclick="removeWarehouse('${escapeHtml(w)}')" title="Eliminar bodega" class="w-7 h-7 rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-600 flex items-center justify-center"><i class="fa-solid fa-trash-can text-[11px]"></i></button>
+            <button type="button" onclick="editWarehouseFromConfig('${escapeHtml(w)}')" title="Editar bodega y ubicación" class="px-2 py-1 rounded-lg bg-[#f1f4fa] hover:bg-[#dfe6f5] text-[#243360] font-bold">
+              <i class="fa-solid fa-pen"></i>
+            </button>
+            <button type="button" onclick="removeWarehouseFromConfig('${escapeHtml(w)}')" title="Eliminar bodega" class="px-2 py-1 rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-600 font-bold">
+              <i class="fa-solid fa-trash"></i>
+            </button>
           </div>
         </div>`;
       }).join('');
 
-      document.getElementById('config-users-list').innerHTML = (appState.users || []).map(u => `
-        <div class="flex items-center justify-between gap-2 px-3 py-2 rounded-xl bg-[#f8fafe] border border-[#dfe6f5] text-xs">
-          <div class="min-w-0">
-            <p class="font-extrabold text-[#243360] truncate">${escapeHtml(u.name)} <span class="text-[10px] uppercase text-[#dca500]">(${escapeHtml(u.role)})</span></p>
-            <p class="text-[11px] text-slate-500 font-mono truncate">Clave: ${escapeHtml(u.password)} • ${escapeHtml(u.warehouse)}</p>
+      const usrList = document.getElementById('config-users-list');
+      usrList.innerHTML = (appState.users || []).map(u => `
+        <div class="p-2.5 rounded-xl bg-[#f8fafe] border border-[#dfe6f5] flex items-center justify-between text-xs">
+          <div>
+            <p class="font-extrabold text-[#243360]">${escapeHtml(u.name)}</p>
+            <p class="text-[11px] text-slate-500">${u.role === 'gerencia' ? 'Gerencia' : 'Técnico'} • Bodega ${escapeHtml(u.warehouse)}</p>
           </div>
-          <div class="flex items-center gap-1 shrink-0">
-            <button type="button" onclick="editUserConfig('${escapeHtml(u.id)}')" title="Editar usuario y clave" class="w-7 h-7 rounded-lg bg-[#f1f4fa] hover:bg-[#dfe6f5] text-[#243360] flex items-center justify-center"><i class="fa-solid fa-pen text-[11px]"></i></button>
-            <button type="button" onclick="removeUser('${escapeHtml(u.id)}')" title="Eliminar usuario" class="w-7 h-7 rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-600 flex items-center justify-center"><i class="fa-solid fa-trash-can text-[11px]"></i></button>
+          <div class="flex items-center gap-1.5">
+            <button type="button" onclick="editUserFromConfig('${escapeHtml(u.id)}')" title="Editar usuario" class="px-2 py-1 rounded-lg bg-[#f1f4fa] hover:bg-[#dfe6f5] text-[#243360] font-bold">
+              <i class="fa-solid fa-pen"></i>
+            </button>
+            ${u.id !== 'usr-ger' ? `<button type="button" onclick="removeUserFromConfig('${escapeHtml(u.id)}')" title="Eliminar usuario" class="px-2 py-1 rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-600 font-bold"><i class="fa-solid fa-trash"></i></button>` : ''}
           </div>
         </div>`).join('');
     }
 
-    function editWarehouseConfig(whName) {
+    function editWarehouseFromConfig(whName) {
       const meta = getWarehouseLocationMeta(whName);
       document.getElementById('config-edit-warehouse-original').value = whName;
       document.getElementById('config-new-warehouse').value = whName;
@@ -4530,59 +4417,64 @@
 
     function saveWarehouseFromConfig(e) {
       e.preventDefault();
-      if (!isManager()) return;
       const origName = document.getElementById('config-edit-warehouse-original').value.trim();
-      const newName = document.getElementById('config-new-warehouse').value.trim();
-      const address = document.getElementById('config-warehouse-address').value.trim() || `Sede Regional ${newName}, Chile`;
-      const latRaw = parseFloat(document.getElementById('config-warehouse-lat').value);
-      const lngRaw = parseFloat(document.getElementById('config-warehouse-lng').value);
-      if (!newName) return;
+      const name = document.getElementById('config-new-warehouse').value.trim();
+      const address = document.getElementById('config-warehouse-address').value.trim();
+      const latRaw = document.getElementById('config-warehouse-lat').value;
+      const lngRaw = document.getElementById('config-warehouse-lng').value;
+      if (!name) return;
 
-      appState.warehouseLocations = appState.warehouseLocations || {};
-      const prevMeta = getWarehouseLocationMeta(origName || newName);
-      const lat = !Number.isNaN(latRaw) ? latRaw : prevMeta.lat;
-      const lng = !Number.isNaN(lngRaw) ? lngRaw : prevMeta.lng;
+      if (!appState.warehouseLocations) appState.warehouseLocations = {};
 
       if (origName) {
-        appState.warehouses = (appState.warehouses || []).map(w => w === origName ? newName : w);
-        if (origName !== newName) {
+        const idx = appState.warehouses.indexOf(origName);
+        if (idx !== -1) appState.warehouses[idx] = name;
+        if (origName !== name && appState.warehouseLocations[origName]) {
           delete appState.warehouseLocations[origName];
-          (appState.machines || []).forEach(m => { if (m.warehouse === origName) m.warehouse = newName; });
-          (appState.parts || []).forEach(p => { if (p.warehouse === origName) p.warehouse = newName; });
-          (appState.users || []).forEach(u => { if (u.warehouse === origName) u.warehouse = newName; });
         }
-      } else if (!appState.warehouses.includes(newName)) {
-        appState.warehouses.push(newName);
+        (appState.machines || []).forEach(m => { if (m.warehouse === origName) m.warehouse = name; });
+        (appState.parts || []).forEach(p => { if (p.warehouse === origName) p.warehouse = name; });
+        (appState.users || []).forEach(u => { if (u.warehouse === origName) u.warehouse = name; });
+      } else if (!appState.warehouses.includes(name)) {
+        appState.warehouses.push(name);
       }
 
-      appState.warehouseLocations[newName] = { address, lat, lng };
+      const prevMeta = getWarehouseLocationMeta(name);
+      appState.warehouseLocations[name] = {
+        address: address || prevMeta.address || `Sede Regional ${name}, Chile`,
+        lat: latRaw !== '' ? parseFloat(latRaw) : prevMeta.lat,
+        lng: lngRaw !== '' ? parseFloat(lngRaw) : prevMeta.lng
+      };
+
       cancelEditWarehouseConfig();
       saveState();
       populateAllWarehouseSelects();
       renderConfigLists();
       refreshAllViews();
-      showToast(origName ? 'Bodega actualizada.' : 'Bodega agregada.');
+      showToast('Bodega y ubicación guardadas.');
     }
 
-    function removeWarehouse(w) {
-      if (!isManager()) return;
-      appState.warehouses = (appState.warehouses || []).filter(x => x !== w);
-      if (appState.warehouseLocations) delete appState.warehouseLocations[w];
+    function removeWarehouseFromConfig(wh) {
+      if (appState.warehouses.length <= 1) return;
+      appState.warehouses = appState.warehouses.filter(w => w !== wh);
+      if (appState.warehouseLocations && appState.warehouseLocations[wh]) {
+        delete appState.warehouseLocations[wh];
+      }
       saveState();
       populateAllWarehouseSelects();
       renderConfigLists();
       refreshAllViews();
     }
 
-    function editUserConfig(userId) {
+    function editUserFromConfig(userId) {
       const u = (appState.users || []).find(x => x.id === userId);
       if (!u) return;
       document.getElementById('config-edit-user-id').value = u.id;
       document.getElementById('config-user-name').value = u.name;
       document.getElementById('config-user-password').value = u.password;
       document.getElementById('config-user-role').value = u.role;
-      document.getElementById('config-user-warehouse').value = u.warehouse || (appState.warehouses[0] || 'Chillán');
-      document.getElementById('config-save-user-btn').textContent = 'Guardar Usuario';
+      document.getElementById('config-user-warehouse').value = u.warehouse;
+      document.getElementById('config-save-user-btn').textContent = 'Guardar Cambios';
       document.getElementById('config-cancel-edit-user-btn').classList.remove('hidden');
     }
 
@@ -4591,13 +4483,15 @@
       document.getElementById('config-user-name').value = '';
       document.getElementById('config-user-password').value = '';
       document.getElementById('config-user-role').value = 'tecnico';
+      if (appState.warehouses?.length) {
+        document.getElementById('config-user-warehouse').value = appState.warehouses[0];
+      }
       document.getElementById('config-save-user-btn').textContent = 'Agregar Usuario';
       document.getElementById('config-cancel-edit-user-btn').classList.add('hidden');
     }
 
     function saveUserFromConfig(e) {
       e.preventDefault();
-      if (!isManager()) return;
       const editId = document.getElementById('config-edit-user-id').value;
       const name = document.getElementById('config-user-name').value.trim();
       const password = document.getElementById('config-user-password').value.trim();
@@ -4619,88 +4513,129 @@
       cancelEditUserConfig();
       saveState();
       renderConfigLists();
-      showToast(editId ? 'Usuario actualizado.' : 'Usuario agregado.');
+      showToast('Usuario guardado.');
     }
 
-    function removeUser(id) {
-      if (!isManager()) return;
-      appState.users = (appState.users || []).filter(u => u.id !== id);
+    function removeUserFromConfig(id) {
+      appState.users = appState.users.filter(u => u.id !== id);
       saveState();
       renderConfigLists();
     }
 
+    function openMachineQrModal(machineId) {
+      const m = appState.machines.find(x => x.id === machineId);
+      if (!m) return;
+      document.getElementById('qr-card-code').textContent = m.code;
+      document.getElementById('qr-card-model').textContent = `${m.brand} ${m.model} (${m.serial})`;
+      const box = document.getElementById('qr-canvas-container');
+      box.innerHTML = '';
+      if (typeof QRCode !== 'undefined') {
+        new QRCode(box, { text: `LYKOS-MACHINE:${m.code}`, width: 156, height: 156 });
+      }
+      document.getElementById('modal-machine-qr').classList.remove('hidden');
+    }
+
+    function openQrScannerModal() {
+      document.getElementById('modal-qr-scanner').classList.remove('hidden');
+      const statusEl = document.getElementById('qr-scanner-status');
+      if (typeof Html5Qrcode === 'undefined') {
+        statusEl.textContent = 'Ingresa el código manualmente.';
+        return;
+      }
+      qrScannerInstance = new Html5Qrcode('qr-reader-region');
+      qrScannerInstance.start(
+        { facingMode: 'environment' },
+        { fps: 10, qrbox: { width: 200, height: 200 } },
+        decoded => {
+          const code = String(decoded).replace('LYKOS-MACHINE:', '').trim();
+          closeQrScannerModal();
+          openMachineByScannedCode(code);
+        },
+        () => {}
+      ).then(() => { statusEl.textContent = 'Apunta la cámara al código QR de la máquina.'; })
+       .catch(() => { statusEl.textContent = 'Cámara no disponible: escribe el código abajo.'; });
+    }
+
+    function closeQrScannerModal() {
+      if (qrScannerInstance) {
+        qrScannerInstance.stop().catch(() => {}).finally(() => { qrScannerInstance = null; });
+      }
+      closeModal('modal-qr-scanner');
+    }
+
+    function openMachineByScannedCode(rawCode) {
+      const clean = String(rawCode || '').replace('LYKOS-MACHINE:', '').trim().toUpperCase();
+      const found = appState.machines.find(m => m.code.toUpperCase() === clean || m.serial.toUpperCase() === clean);
+      if (found) {
+        openLifecycleModal(found.id);
+      } else {
+        showToast(`No se encontró máquina con código "${clean}".`, 'error');
+      }
+    }
+
+    function openMobileShareModal() {
+      const url = window.location.href;
+      document.getElementById('mobile-share-url').value = url;
+      const box = document.getElementById('mobile-share-qr');
+      box.innerHTML = '';
+      if (typeof QRCode !== 'undefined') {
+        new QRCode(box, { text: url, width: 150, height: 150 });
+      }
+      document.getElementById('modal-mobile-share').classList.remove('hidden');
+    }
+
+    function copyMobileShareUrl() {
+      const input = document.getElementById('mobile-share-url');
+      input.select();
+      document.execCommand('copy');
+      showToast('Enlace copiado.');
+    }
+
     function exportDataJSON() {
-      if (!isManager()) return;
       const blob = new Blob([JSON.stringify(appState, null, 2)], { type: 'application/json' });
       const a = document.createElement('a');
       a.href = URL.createObjectURL(blob);
-      a.download = `lykos-respaldo-${getChileDateTimeLocal().slice(0, 10)}.json`;
+      a.download = `LYKOS_Respaldo_${getChileDateTimeLocal().slice(0, 10)}.json`;
       a.click();
     }
 
-    // =========================================================================
-    // AUTENTICACIÓN UNIFICADA
-    // =========================================================================
     function handleUnifiedLoginSubmit(e) {
       if (e) e.preventDefault();
-      const uInp = document.getElementById('login-username').value.trim().toLowerCase();
-      const pInp = document.getElementById('login-password').value.trim();
+      const uVal = document.getElementById('login-username').value.trim().toLowerCase();
+      const pVal = document.getElementById('login-password').value.trim();
       const errBox = document.getElementById('login-error-box');
-      const found = (appState.users || []).find(u => u.name.toLowerCase() === uInp && String(u.password) === pInp);
 
-      if (!found) {
-        errBox.classList.remove('hidden');
+      const matched = (appState.users || []).find(
+        u => u.name.trim().toLowerCase() === uVal && String(u.password) === pVal
+      );
+
+      if (!matched) {
         document.getElementById('login-error-text').textContent = 'Usuario o clave incorrectos.';
+        errBox.classList.remove('hidden');
         return;
       }
 
       errBox.classList.add('hidden');
-      currentSession = { id: found.id, name: found.name, role: found.role, warehouse: found.warehouse || 'Chillán' };
-      sessionStorage.setItem('lykos_active_session_v1', JSON.stringify(currentSession));
-
+      currentSession = { ...matched };
       document.getElementById('auth-screen').style.display = 'none';
-      document.getElementById('auth-screen').classList.add('hidden');
       const shell = document.getElementById('protected-app-shell');
       shell.style.display = 'block';
       shell.classList.remove('hidden');
-
       applyRolePermissionsToUI();
-      switchTab('inventory');
-      showToast(`Bienvenido, ${currentSession.name}.`);
+      refreshAllViews();
+      showToast(`Bienvenido, ${currentSession.name}`);
     }
 
     function openAuthScreen() {
-      currentSession = null;
-      sessionStorage.removeItem('lykos_active_session_v1');
+      document.getElementById('login-password').value = '';
+      document.getElementById('login-error-box').classList.add('hidden');
       const shell = document.getElementById('protected-app-shell');
       shell.style.display = 'none';
       shell.classList.add('hidden');
       const auth = document.getElementById('auth-screen');
       auth.style.display = 'flex';
       auth.classList.remove('hidden');
-      document.getElementById('login-password').value = '';
     }
-
-    document.addEventListener('DOMContentLoaded', () => {
-      populateAllWarehouseSelects();
-      const saved = sessionStorage.getItem('lykos_active_session_v1');
-      if (saved) {
-        try {
-          currentSession = JSON.parse(saved);
-          if (currentSession && currentSession.name) {
-            document.getElementById('auth-screen').style.display = 'none';
-            document.getElementById('auth-screen').classList.add('hidden');
-            const shell = document.getElementById('protected-app-shell');
-            shell.style.display = 'block';
-            shell.classList.remove('hidden');
-            applyRolePermissionsToUI();
-            switchTab('inventory');
-            return;
-          }
-        } catch (e) {}
-      }
-      openAuthScreen();
-    });
   </script>
 </body>
 </html>
